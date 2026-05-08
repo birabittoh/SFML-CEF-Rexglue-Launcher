@@ -160,6 +160,117 @@ void downloadProgressCallback(long long downloaded, long long total) {
 
 }
 
+// ── Zip extraction helper ──────────────────────────────────────────────────
+// Extracts a zip file to destPath using PowerShell's Expand-Archive cmdlet.
+// Runs synchronously (blocks the calling thread until extraction completes).
+// Returns true on success.
+static bool ExtractZipWithPowerShell(const std::string& zipPath, const std::string& destPath) {
+	// Escape single quotes for PowerShell single-quoted strings ('' is the escape)
+	auto escPS = [](const std::string& s) -> std::string {
+		std::string out;
+		out.reserve(s.size());
+		for (char c : s) {
+			if (c == '\'') out += "''";
+			else out += c;
+		}
+		return out;
+	};
+
+	// Write a temporary .ps1 script to avoid command-line quoting issues
+	char tempDir[MAX_PATH];
+	GetTempPathA(MAX_PATH, tempDir);
+	std::string scriptPath = std::string(tempDir) +
+		"goopie_extract_" + std::to_string(GetCurrentProcessId()) +
+		"_" + std::to_string(GetCurrentThreadId()) + ".ps1";
+
+	{
+		std::ofstream sf(scriptPath);
+		if (!sf) {
+			std::cout << "ExtractZip: failed to create temp script at " << scriptPath << std::endl;
+			return false;
+		}
+		sf << "Expand-Archive -LiteralPath '" << escPS(zipPath)
+		   << "' -DestinationPath '" << escPS(destPath) << "' -Force\n";
+	}
+
+	std::string cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \""
+		+ scriptPath + "\"";
+	std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+	cmdBuf.push_back('\0');
+
+	STARTUPINFOA si = {};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {};
+
+	BOOL ok = CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+	if (!ok) {
+		std::cout << "ExtractZip: CreateProcess failed (error " << GetLastError() << ")" << std::endl;
+		std::filesystem::remove(scriptPath);
+		return false;
+	}
+
+	// Wait up to 5 minutes for extraction
+	WaitForSingleObject(pi.hProcess, 300000);
+	DWORD exitCode = 1;
+	GetExitCodeProcess(pi.hProcess, &exitCode);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	std::filesystem::remove(scriptPath);
+
+	if (exitCode != 0) {
+		std::cout << "ExtractZip: PowerShell exited with code " << exitCode << std::endl;
+		return false;
+	}
+	return true;
+}
+
+// ── Packages sidecar helpers ───────────────────────────────────────────────
+// .installed_packages.json format: {"assetname.zip":true, ...}
+
+static std::mutex s_packagesSidecarMutex;
+
+// Records that a package has been successfully installed.
+static void UpdatePackageSidecar(const std::string& sidecarPath, const std::string& assetName) {
+	std::lock_guard<std::mutex> lock(s_packagesSidecarMutex);
+
+	auto escJson = [](const std::string& s) -> std::string {
+		std::string out;
+		for (char c : s) {
+			if (c == '"') out += "\\\"";
+			else if (c == '\\') out += "\\\\";
+			else out += c;
+		}
+		return out;
+	};
+
+	std::string existing = "{}";
+	{
+		std::ifstream rf(sidecarPath, std::ios::binary);
+		if (rf) {
+			std::string tmp((std::istreambuf_iterator<char>(rf)), {});
+			if (!tmp.empty()) existing = tmp;
+		}
+	}
+
+	std::string key = "\"" + escJson(assetName) + "\"";
+	// If already present, nothing to do
+	if (existing.find(key) != std::string::npos) return;
+
+	// Append the new key: strip trailing '}', add ',key:true}'
+	if (!existing.empty() && existing.back() == '}') existing.pop_back();
+	std::string newJson;
+	if (existing == "{") {
+		newJson = "{" + key + ":true}";
+	} else {
+		newJson = existing + "," + key + ":true}";
+	}
+
+	std::ofstream wf(sidecarPath, std::ios::binary | std::ios::trunc);
+	if (wf) wf << newJson;
+}
+
 // Window procedure to handle resize messages
 LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	if (uMsg == WM_SIZE && g_browser && g_browser->GetHost()) {
@@ -341,6 +452,12 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 		v8context->GetGlobal()->SetValue("deleteCurrentSave",
 			CefV8Value::CreateFunction("deleteCurrentSave", this), V8_PROPERTY_ATTRIBUTE_NONE);
+
+		v8context->GetGlobal()->SetValue("InstallPackage",
+			CefV8Value::CreateFunction("InstallPackage", this), V8_PROPERTY_ATTRIBUTE_NONE);
+
+		v8context->GetGlobal()->SetValue("IsPackageInstalled",
+			CefV8Value::CreateFunction("IsPackageInstalled", this), V8_PROPERTY_ATTRIBUTE_NONE);
 	}
 	bool Execute(const CefString& name,
 		CefRefPtr<CefV8Value> object,
@@ -612,6 +729,31 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				versionTag = arguments[3]->GetStringValue().ToString();
 			}
 
+			// Optional 5th argument: JSON array of zip packages to download and extract.
+			// Each entry: {"assetName":"foo.zip","hasExecutable":false,"executablePath":""}
+			struct PkgInfo {
+				std::string assetName;
+				bool hasExecutable;
+				std::string executablePath;
+			};
+			std::vector<PkgInfo> packages;
+			if (arguments.size() >= 5 && arguments[4]->IsString()) {
+				std::string pkgsJson = arguments[4]->GetStringValue().ToString();
+				CefRefPtr<CefValue> parsed = CefParseJSON(CefString(pkgsJson), JSON_PARSER_ALLOW_TRAILING_COMMAS);
+				if (parsed && parsed->GetType() == VTYPE_LIST) {
+					CefRefPtr<CefListValue> list = parsed->GetList();
+					for (size_t pi = 0; pi < list->GetSize(); ++pi) {
+						if (list->GetType(pi) != VTYPE_DICTIONARY) continue;
+						auto d = list->GetDictionary(pi);
+						PkgInfo p;
+						p.assetName = d->GetString("assetName").ToString();
+						p.hasExecutable = d->GetBool("hasExecutable");
+						p.executablePath = d->GetString("executablePath").ToString();
+						if (!p.assetName.empty()) packages.push_back(p);
+					}
+				}
+			}
+
 			// Construct the download URL from the GitHub releases URL. We always save
 			// to the canonical `<GameName>-windows-x64.exe` so `Play` keeps working
 			// regardless of which build flavour was selected.
@@ -630,6 +772,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 			// Sidecar describing what is installed; written after a successful download.
 			std::string sidecarPath = (gameDir / ".installed.json").string();
+			std::string packagesSidecarPath = (gameDir / ".installed_packages.json").string();
 
 			// Create the directory if it doesn't exist
 			if (!std::filesystem::exists(gameDir)) {
@@ -637,7 +780,8 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			}
 
 			// Download from GitHub releases
-			std::thread([downloadUrl, localPath, tomlDownloadUrl, tomlLocalPath, sidecarPath, assetName, versionTag]() {
+			std::thread([downloadUrl, localPath, tomlDownloadUrl, tomlLocalPath, sidecarPath, packagesSidecarPath,
+			             assetName, versionTag, packages, gameDir, GameGit]() {
 				try {
 					staticprogress = 0;
 					Networking::FileDownloader downloader;
@@ -678,6 +822,34 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 							std::cout << "Wrote installed sidecar: " << sidecarPath << std::endl;
 						} else {
 							std::cout << "Warning: failed to write sidecar at " << sidecarPath << std::endl;
+						}
+					}
+
+					// Download and extract each zip package
+					for (const auto& pkg : packages) {
+						std::cout << "Downloading package: " << pkg.assetName << std::endl;
+						staticprogress = 0;
+						std::string pkgDownloadUrl = GameGit + pkg.assetName;
+						std::string pkgLocalZip = (gameDir / pkg.assetName).string();
+
+						Networking::FileDownloader pkgDownloader;
+						auto pkgResult = pkgDownloader.downloadFile(pkgDownloadUrl, pkgLocalZip, downloadProgressCallback);
+
+						if (pkgResult == Networking::FileDownloader::Result::SUCCESS) {
+							std::cout << "Extracting package: " << pkg.assetName << " -> " << gameDir.string() << std::endl;
+							bool extracted = ExtractZipWithPowerShell(pkgLocalZip, gameDir.string());
+							// Remove the zip regardless of extraction outcome
+							std::error_code ec;
+							std::filesystem::remove(pkgLocalZip, ec);
+
+							if (extracted) {
+								UpdatePackageSidecar(packagesSidecarPath, pkg.assetName);
+								std::cout << "Package installed: " << pkg.assetName << std::endl;
+							} else {
+								std::cout << "Failed to extract package: " << pkg.assetName << std::endl;
+							}
+						} else {
+							std::cout << "Failed to download package: " << pkg.assetName << std::endl;
 						}
 					}
 
@@ -829,11 +1001,27 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				cvarArgs = arguments[1]->GetStringValue().ToString();
 			}
 
-			std::string exeFileName = GameName + "-windows-x64.exe";
-			std::filesystem::path exePath = std::filesystem::path(GetGamesFolder()) / GameName / exeFileName;
+			// Optional third arg: relative exe path from a zip package,
+			// e.g. "launcher.exe" or "bin/launcher.exe".
+			// Falls back to the canonical "<GameName>-windows-x64.exe".
+			std::string customExePath;
+			if (arguments.size() > 2 && arguments[2] && arguments[2]->IsString()) {
+				customExePath = arguments[2]->GetStringValue().ToString();
+			}
+
+			std::filesystem::path exePath;
+			if (!customExePath.empty()) {
+				// Normalize forward slashes to backslashes for Windows
+				std::replace(customExePath.begin(), customExePath.end(), '/', '\\');
+				exePath = std::filesystem::path(GetGamesFolder()) / GameName / customExePath;
+			} else {
+				std::string exeFileName = GameName + "-windows-x64.exe";
+				exePath = std::filesystem::path(GetGamesFolder()) / GameName / exeFileName;
+			}
 			if (std::filesystem::exists(exePath)) {
 				std::string patches = "";
 				std::string launchDir = (std::filesystem::path(GetGamesFolder()) / GameName).string();
+				std::string exeFileName = exePath.filename().string();
 
 				int userLanguage = 1;
 				HKEY hKey;
@@ -913,6 +1101,98 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 		if (name == "getVersion") {
 			retval = CefV8Value::CreateInt(9); // Returns the current version of the Launcher exe
+			return true;
+		}
+
+		// ── InstallPackage ─────────────────────────────────────────────────────
+		// InstallPackage(GameName, DownloadPrefix, ZipAssetName, HasExecutable, ExecutablePath)
+		// Downloads a ZIP from the GitHub release and extracts it into the game
+		// folder, then records it in .installed_packages.json.
+		if (name == "InstallPackage") {
+			if (arguments.size() < 3 || !arguments[0]->IsString() || !arguments[2]->IsString()) {
+				std::cout << "InstallPackage: invalid arguments" << std::endl;
+				return true;
+			}
+
+			std::string GameName = arguments[0]->GetStringValue().ToString();
+			std::string DownloadPrefix;
+			if (arguments.size() >= 2 && arguments[1]->IsString()) {
+				DownloadPrefix = arguments[1]->GetStringValue().ToString();
+			}
+			if (!DownloadPrefix.empty() && DownloadPrefix.back() != '/') DownloadPrefix += '/';
+			std::string ZipAssetName = arguments[2]->GetStringValue().ToString();
+
+			std::filesystem::path gameDir = std::filesystem::path(GetGamesFolder()) / GameName;
+			std::string zipLocalPath = (gameDir / ZipAssetName).string();
+			std::string packagesSidecarPath = (gameDir / ".installed_packages.json").string();
+
+			if (!std::filesystem::exists(gameDir)) {
+				std::filesystem::create_directories(gameDir);
+			}
+
+			std::thread([GameName, DownloadPrefix, ZipAssetName, zipLocalPath, gameDir, packagesSidecarPath]() {
+				try {
+					std::string downloadUrl = DownloadPrefix + ZipAssetName;
+					std::cout << "InstallPackage: downloading " << downloadUrl << std::endl;
+					staticprogress = 0;
+
+					Networking::FileDownloader pkgDownloader;
+					auto result = pkgDownloader.downloadFile(downloadUrl, zipLocalPath, downloadProgressCallback);
+
+					if (result == Networking::FileDownloader::Result::SUCCESS) {
+						std::cout << "InstallPackage: extracting " << ZipAssetName << std::endl;
+						bool extracted = ExtractZipWithPowerShell(zipLocalPath, gameDir.string());
+						std::error_code ec;
+						std::filesystem::remove(zipLocalPath, ec);
+
+						if (extracted) {
+							UpdatePackageSidecar(packagesSidecarPath, ZipAssetName);
+							std::cout << "InstallPackage: done " << ZipAssetName << std::endl;
+						} else {
+							std::cout << "InstallPackage: extraction failed for " << ZipAssetName << std::endl;
+						}
+					} else {
+						std::cout << "InstallPackage: download failed for " << ZipAssetName << std::endl;
+					}
+
+					staticprogress = -1;
+				} catch (const std::exception& e) {
+					std::cout << "InstallPackage error: " << e.what() << std::endl;
+					staticprogress = -1;
+				}
+			}).detach();
+
+			return true;
+		}
+
+		// ── IsPackageInstalled ─────────────────────────────────────────────────
+		// IsPackageInstalled(GameName, ZipAssetName) -> bool
+		// Returns true if the named package appears in .installed_packages.json.
+		if (name == "IsPackageInstalled") {
+			if (arguments.size() < 2 || !arguments[0]->IsString() || !arguments[1]->IsString()) {
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+			std::string GameName = arguments[0]->GetStringValue().ToString();
+			std::string ZipAssetName = arguments[1]->GetStringValue().ToString();
+
+			std::filesystem::path sidecarPath =
+				std::filesystem::path(GetGamesFolder()) / GameName / ".installed_packages.json";
+
+			if (!std::filesystem::exists(sidecarPath)) {
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+
+			std::ifstream rf(sidecarPath, std::ios::binary);
+			if (!rf) {
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+			std::string contents((std::istreambuf_iterator<char>(rf)), {});
+			// The key in the JSON is the quoted asset name
+			bool installed = contents.find("\"" + ZipAssetName + "\"") != std::string::npos;
+			retval = CefV8Value::CreateBool(installed);
 			return true;
 		}
 
