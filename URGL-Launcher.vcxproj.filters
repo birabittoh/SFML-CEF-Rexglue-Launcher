@@ -1,0 +1,88 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Launcher">
+      <UniqueIdentifier>{57ACF9E2-4379-54EE-6C92-429658BE897C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Launcher\Networking">
+      <UniqueIdentifier>{0EB17F28-7A12-5D36-0380-A3E86FE093F5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Launcher\Utils">
+      <UniqueIdentifier>{F7527B37-E320-6F3D-CCB4-DF63B8214BA2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Launcher\Utils\Crypto">
+      <UniqueIdentifier>{C76F5D6F-33DC-186A-FCCF-B0C768FB3AD2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Launcher\Window">
+      <UniqueIdentifier>{5E91CB2A-CA1C-39EF-D32D-BCE33F3895EF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Vendors">
+      <UniqueIdentifier>{665268D3-D231-E76E-DB49-724547A84DD0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Vendors\glad">
+      <UniqueIdentifier>{2D95E66C-19F8-7511-C27D-AEC7AEBF4194}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Vendors\stb_image">
+      <UniqueIdentifier>{80BA2187-ECD0-1F1D-3548-AB3EA19DF0A4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Launcher\Renut">
+      <UniqueIdentifier>{799bd71f-036b-48fd-888b-776b285cc884}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Source\Networking\FileDownloader.h">
+      <Filter>Launcher\Networking</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Utils\Crypto\sha256.h">
+      <Filter>Launcher\Utils\Crypto</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Utils\IsoExtraction.h">
+      <Filter>Launcher\Utils</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Window\OpenGL_Stuff.h">
+      <Filter>Launcher\Window</Filter>
+    </ClInclude>
+    <ClInclude Include="Source\Window\Window.h">
+      <Filter>Launcher\Window</Filter>
+    </ClInclude>
+    <ClInclude Include="Vendors\stb_image\stb_image.h">
+      <Filter>Vendors\stb_image</Filter>
+    </ClInclude>
+    <ClInclude Include="Vendors\stb_image\stb_image_write.h">
+      <Filter>Vendors\stb_image</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="VehicleParser.h">
+      <Filter>Launcher\Renut</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Source\Networking\FileDownloader.cpp">
+      <Filter>Launcher\Networking</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\NewLauncher.cpp">
+      <Filter>Launcher</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Utils\Crypto\sha256.cpp">
+      <Filter>Launcher\Utils\Crypto</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Utils\IsoExtraction.cpp">
+      <Filter>Launcher\Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="Source\Window\Window.cpp">
+      <Filter>Launcher\Window</Filter>
+    </ClCompile>
+    <ClCompile Include="Vendors\glad.c">
+      <Filter>Vendors\glad</Filter>
+    </ClCompile>
+    <ClCompile Include="Vendors\stb_image\stb_image.cpp">
+      <Filter>Vendors\stb_image</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="C:\Users\mag11\Downloads\RexGlueIcon.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="URGL-Launcher.rc" />
+  </ItemGroup>
+</Project>

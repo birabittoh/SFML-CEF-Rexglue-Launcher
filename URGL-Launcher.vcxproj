@@ -1,0 +1,95 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5E007D86-CAC0-F8BC-93FB-413AFF7A3D99}</ProjectGuid>
+    <IgnoreWarnCompileDuplicatedFilename>true</IgnoreWarnCompileDuplicatedFilename>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>URGL-Launcher</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <CharacterSet>Unicode</CharacterSet>
+    <PlatformToolset>v145</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+    <OutDir>$(ProjectDir)Build\Release-windows-x86_64\URGL-Launcher\</OutDir>
+    <IntDir>$(ProjectDir)Build\Intermediates\Release-windows-x86_64\URGL-Launcher\</IntDir>
+    <TargetName>Goopie-Launcher</TargetName>
+    <TargetExt>.exe</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <PreprocessorDefinitions>PLATFORM_WINDOWS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>Vendors;Vendors\GLFW\include;Vendors\Chromium\include;Vendors\Chromium;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <Optimization>Full</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <MinimalRebuild>false</MinimalRebuild>
+      <StringPooling>true</StringPooling>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <ExternalWarningLevel>Level3</ExternalWarningLevel>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>glfw3_mt.lib;opengl32.lib;libcef.lib;libcef_dll_wrapper.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>Vendors\GLFW\lib-vc2022;Vendors\Chromium\Release;Vendors\Chromium;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalOptions>/SUBSYSTEM:WINDOWS %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <ProjectReference>
+    </ProjectReference>
+    <PostBuildEvent>
+      <Command>IF EXIST Assets\ (xcopy /Q /E /Y /I Assets Build\Release-windows-x86_64\URGL-Launcher\Assets &gt; nul) ELSE (xcopy /Q /Y /I Assets Build\Release-windows-x86_64\URGL-Launcher\Assets &gt; nul)</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="resource.h" />
+    <ClInclude Include="Source\Networking\FileDownloader.h" />
+    <ClInclude Include="Source\Utils\Crypto\sha256.h" />
+    <ClInclude Include="Source\Utils\IsoExtraction.h" />
+    <ClInclude Include="Source\Window\OpenGL_Stuff.h" />
+    <ClInclude Include="Source\Window\Window.h" />
+    <ClInclude Include="VehicleParser.h" />
+    <ClInclude Include="Vendors\stb_image\stb_image.h" />
+    <ClInclude Include="Vendors\stb_image\stb_image_write.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Source\Networking\FileDownloader.cpp" />
+    <ClCompile Include="Source\NewLauncher.cpp" />
+    <ClCompile Include="Source\Utils\Crypto\sha256.cpp" />
+    <ClCompile Include="Source\Utils\IsoExtraction.cpp" />
+    <ClCompile Include="Source\Window\Window.cpp" />
+    <ClCompile Include="Vendors\glad.c" />
+    <ClCompile Include="Vendors\stb_image\stb_image.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="C:\Users\mag11\Downloads\RexGlueIcon.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="URGL-Launcher.rc" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

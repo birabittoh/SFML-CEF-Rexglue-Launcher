@@ -1,0 +1,18 @@
+# Build output
+Build/
+
+# Visual Studio files
+.vs/
+*.vcxproj.user
+
+# CEF prebuilt binary distribution (4.9 GB - download separately)
+# See README.md for setup instructions
+Vendors/Chromium/
+
+# Runtime output / cache
+cef_cache/
+dumped_vehicles/
+
+# OS files
+Thumbs.db
+.DS_Store

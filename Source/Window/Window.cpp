@@ -1,0 +1,101 @@
+#include "Window.h"
+#include "OpenGL_Stuff.h"
+
+#define GLFW_EXPOSE_NATIVE_WIN32
+
+#include <GLFW/glfw3native.h> // Include this for native access
+
+
+#pragma comment(lib, "dwmapi.lib")
+
+#include <dwmapi.h>
+
+
+void VinceWindow::EnableBlur()
+{
+	HWND hwnd = glfwGetWin32Window(window.get());
+	if (!hwnd) return;
+
+	// DWM: Extend frame into client area (title bar and borders)
+	MARGINS margins = { -1 }; // -1 means extend to the whole window
+	DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+	// Existing blur code...
+	const HINSTANCE hModule = LoadLibrary(TEXT("user32.dll"));
+	if (hModule)
+	{
+		typedef struct _ACCENT_POLICY
+		{
+			int nAccentState;
+			int nFlags;
+			int nColor;
+			int nAnimationId;
+		} ACCENT_POLICY;
+
+		typedef struct _WINDOWCOMPOSITIONATTRIBDATA
+		{
+			int nAttribute;
+			PVOID pData;
+			SIZE_T ulDataSize;
+		} WINDOWCOMPOSITIONATTRIBDATA;
+
+		enum AccentState
+		{
+			ACCENT_DISABLED = 0,
+			ACCENT_ENABLE_BLURBEHIND = 3,
+			ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 // Windows 10/11
+		};
+
+		auto SetWindowCompositionAttribute = (BOOL(WINAPI*)(HWND, WINDOWCOMPOSITIONATTRIBDATA*))GetProcAddress(hModule, "SetWindowCompositionAttribute");
+		if (SetWindowCompositionAttribute)
+		{
+			ACCENT_POLICY policy = { ACCENT_ENABLE_BLURBEHIND, 0, 0, 0 };
+			WINDOWCOMPOSITIONATTRIBDATA data = { 19, &policy, sizeof(policy) };
+			SetWindowCompositionAttribute(hwnd, &data);
+		}
+		FreeLibrary(hModule);
+	}
+}
+
+void VinceWindow::init()
+{
+	glfwSetErrorCallback(glfw_error_callback);
+	if (!glfwInit())
+		assert(false && "Failed to initialize GLFW");
+
+	// GL 3.0 + GLSL 330
+	glsl_version = "#version 330";
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+	glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE);
+
+	const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
+	glfwWindowHint(GLFW_RED_BITS, mode->redBits);
+	glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
+	glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
+	glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
+
+	// Create window with graphics context using unique_ptr and custom deleter
+	window = std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)>(
+		glfwCreateWindow(mode->width/ 1.5, mode->height/ 1.5, "Goopie Launcher 1.8", nullptr, nullptr),
+		//glfwCreateWindow(mode->width, mode->height, "Goopie Launcher 1.7", nullptr, nullptr),
+		&glfwDestroyWindow
+	);
+	if (!window) {
+		assert(false && "Failed to create GLFW window");
+	}
+
+	int bufferWidth, bufferHeight;
+	glfwGetFramebufferSize(window.get(), &bufferWidth, &bufferHeight);
+	glfwMakeContextCurrent(window.get());
+
+	glfwSwapInterval(1); // Enable vsync
+	//clear the screen with black
+
+	if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+		assert(false && "Failed to initialize OpenGL context");
+	}
+
+	glViewport(0, 0, bufferWidth, bufferHeight);
+	VinceWindow::EnableBlur();
+}
