@@ -77,7 +77,7 @@ void VinceWindow::init()
 
 	// Create window with graphics context using unique_ptr and custom deleter
 	window = std::unique_ptr<GLFWwindow, decltype(&glfwDestroyWindow)>(
-		glfwCreateWindow(mode->width/ 1.5, mode->height/ 1.5, "Goopie Launcher 1.8", nullptr, nullptr),
+		glfwCreateWindow(mode->width/ 1.5, mode->height/ 1.5, "Goopie Launcher 1.9", nullptr, nullptr),
 		//glfwCreateWindow(mode->width, mode->height, "Goopie Launcher 1.7", nullptr, nullptr),
 		&glfwDestroyWindow
 	);

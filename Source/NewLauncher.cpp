@@ -1669,7 +1669,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	}
 	CefSettings settings;
 	settings.multi_threaded_message_loop = true;
-	CefString(&settings.cache_path).FromString((std::filesystem::current_path() / "cef_cache").string());
+	//CefString(&settings.cache_path).FromString((std::filesystem::current_path() / "cef_cache").string());
 	CefInitialize(main_args, settings, app.get(), nullptr);
 
 	//sleep until the cef is ready
@@ -1719,8 +1719,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	} else {
 		std::cout << "Using production server at goopie.xyz" << std::endl;
 	}
-	//CefBrowserHost::CreateBrowser(window_info, client.get(), "https://goopie.xyz", CefBrowserSettings(), nullptr, nullptr);
-	CefBrowserHost::CreateBrowser(window_info, client.get(), "http://localhost:5173/", CefBrowserSettings(), nullptr, nullptr);
+	CefBrowserHost::CreateBrowser(window_info, client.get(), "https://goopie.xyz", CefBrowserSettings(), nullptr, nullptr);
+	//CefBrowserHost::CreateBrowser(window_info, client.get(), "http://localhost:5173/", CefBrowserSettings(), nullptr, nullptr);
 
 	while (!glfwWindowShouldClose(window.getWindow()))
 	{
