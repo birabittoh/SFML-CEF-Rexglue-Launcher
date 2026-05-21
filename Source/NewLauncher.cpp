@@ -1,3 +1,7 @@
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/utsname.h>
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -226,6 +230,98 @@ static bool ExtractZipWithPowerShell(const std::string& zipPath, const std::stri
 	return true;
 }
 
+// ── Archive asset helpers ──────────────────────────────────────────────────
+
+static bool isZipAsset(const std::string& name) {
+	if (name.size() < 4) return false;
+	std::string lower(name);
+	std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+	return lower.size() >= 4 && lower.substr(lower.size() - 4) == ".zip";
+}
+
+static bool isTarGzAsset(const std::string& name) {
+	std::string lower(name);
+	std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+	return lower.size() >= 7 && lower.substr(lower.size() - 7) == ".tar.gz";
+}
+
+static bool isArchiveAsset(const std::string& name) {
+	return isZipAsset(name) || isTarGzAsset(name);
+}
+
+// Dispatches to the appropriate extraction method based on archive type.
+// Returns true on success. Linux extraction is not yet implemented.
+static bool ExtractArchive(const std::string& archivePath, const std::string& destPath) {
+	if (isZipAsset(archivePath)) {
+#ifdef _WIN32
+		return ExtractZipWithPowerShell(archivePath, destPath);
+#else
+		std::cout << "ExtractArchive: zip extraction not yet implemented on this platform" << std::endl;
+		return false;
+#endif
+	}
+	if (isTarGzAsset(archivePath)) {
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+		// Windows 10 1803+ ships tar.exe; Linux/macOS have it natively.
+		std::string cmd = "tar xzf \"" + archivePath + "\" -C \"" + destPath + "\"";
+		int rc = std::system(cmd.c_str());
+		if (rc != 0) {
+			std::cout << "ExtractArchive: tar exited with code " << rc << std::endl;
+			return false;
+		}
+		return true;
+#else
+		std::cout << "ExtractArchive: tar.gz extraction not supported on this platform" << std::endl;
+		return false;
+#endif
+	}
+	std::cout << "ExtractArchive: unrecognized archive type: " << archivePath << std::endl;
+	return false;
+}
+
+// Searches the root of gameDir for the main executable.
+// On Windows prefers <gameName>.exe, then falls back to the first .exe found.
+// Returns just the filename, or empty string if nothing found.
+static std::string FindMainExecutable(const std::filesystem::path& gameDir, const std::string& gameName) {
+	std::string preferred;
+	std::string fallback;
+#ifdef _WIN32
+	preferred = gameName + ".exe";
+	std::string preferredLower(preferred);
+	std::transform(preferredLower.begin(), preferredLower.end(), preferredLower.begin(), ::tolower);
+
+	std::error_code ec;
+	for (const auto& entry : std::filesystem::directory_iterator(gameDir, ec)) {
+		if (!entry.is_regular_file(ec)) continue;
+		std::string fname = entry.path().filename().string();
+		std::string fnameLower(fname);
+		std::transform(fnameLower.begin(), fnameLower.end(), fnameLower.begin(), ::tolower);
+		if (fnameLower == preferredLower) return fname;
+		if (fallback.empty() && fnameLower.size() >= 4 &&
+			fnameLower.substr(fnameLower.size() - 4) == ".exe") {
+			fallback = fname;
+		}
+	}
+#else
+	// On Linux/macOS the main binary typically has no extension and is executable.
+	// Prefer <gameName> exactly, then any executable file without an extension.
+	preferred = gameName;
+	std::error_code ec;
+	for (const auto& entry : std::filesystem::directory_iterator(gameDir, ec)) {
+		if (!entry.is_regular_file(ec)) continue;
+		std::string fname = entry.path().filename().string();
+		if (fname == preferred) return fname;
+		// Executables without an extension
+		if (fallback.empty() && fname.find('.') == std::string::npos) {
+			std::filesystem::perms p = entry.status(ec).permissions();
+			if ((p & std::filesystem::perms::owner_exec) != std::filesystem::perms::none)
+				fallback = fname;
+		}
+	}
+#endif
+	return fallback;
+}
+
 // ── Packages sidecar helpers ───────────────────────────────────────────────
 // .installed_packages.json format: {"assetname.zip":true, ...}
 
@@ -438,6 +534,9 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		v8context->GetGlobal()->SetValue("GetPlatform",
 			CefV8Value::CreateFunction("GetPlatform", this), V8_PROPERTY_ATTRIBUTE_NONE);
 
+		v8context->GetGlobal()->SetValue("GetArch",
+			CefV8Value::CreateFunction("GetArch", this), V8_PROPERTY_ATTRIBUTE_NONE);
+
 		v8context->GetGlobal()->SetValue("SetLanguage",
 			CefV8Value::CreateFunction("SetLanguage", this), V8_PROPERTY_ATTRIBUTE_NONE);
 
@@ -501,6 +600,29 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				retval = CefV8Value::CreateString("Linux");
 			#else
 				retval = CefV8Value::CreateString("Unknown");
+			#endif
+			return true;
+		}
+
+		if (name == "GetArch") {
+			#ifdef _WIN32
+				SYSTEM_INFO si = {};
+				GetNativeSystemInfo(&si);
+				switch (si.wProcessorArchitecture) {
+					case PROCESSOR_ARCHITECTURE_AMD64: retval = CefV8Value::CreateString("x86_64"); break;
+					case PROCESSOR_ARCHITECTURE_ARM64: retval = CefV8Value::CreateString("arm64"); break;
+					case PROCESSOR_ARCHITECTURE_INTEL: retval = CefV8Value::CreateString("x86"); break;
+					default: retval = CefV8Value::CreateString("unknown"); break;
+				}
+			#elif defined(__linux__) || defined(__APPLE__)
+				struct utsname buf = {};
+				if (uname(&buf) == 0) {
+					retval = CefV8Value::CreateString(buf.machine);
+				} else {
+					retval = CefV8Value::CreateString("unknown");
+				}
+			#else
+				retval = CefV8Value::CreateString("unknown");
 			#endif
 			return true;
 		}
@@ -596,10 +718,37 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 		if (name == "isExeUpdated") {
 			std::string GameName = arguments[0]->GetStringValue().ToString();
-			std::string exeFileName = GameName + "-windows-x64.exe";
-			std::filesystem::path versionPath = std::filesystem::path(GetGamesFolder()) / GameName / exeFileName;
-			bool installed = std::filesystem::exists(versionPath);
-			retval = CefV8Value::CreateBool(installed); //Checks if the exe is the latest version
+			std::filesystem::path gameDir = std::filesystem::path(GetGamesFolder()) / GameName;
+
+			// Check legacy canonical exe first.
+			std::filesystem::path canonicalExe = gameDir / (GameName + "-windows-x64.exe");
+			bool installed = std::filesystem::exists(canonicalExe);
+
+			// For archive-format installs the canonical name doesn't exist — check the
+			// exePath recorded in .installed.json instead.
+			if (!installed) {
+				std::filesystem::path sidecarPath = gameDir / ".installed.json";
+				std::ifstream f(sidecarPath, std::ios::binary);
+				if (f) {
+					std::string contents(std::istreambuf_iterator<char>(f), {});
+					// Extract "exePath" value.
+					auto findField = [&](const std::string& key) -> std::string {
+						std::string search = "\"" + key + "\":\"";
+						size_t pos = contents.find(search);
+						if (pos == std::string::npos) { search = "\"" + key + "\": \""; pos = contents.find(search); }
+						if (pos == std::string::npos) return "";
+						size_t start = pos + search.size();
+						size_t end = contents.find("\"", start);
+						return (end == std::string::npos) ? "" : contents.substr(start, end - start);
+					};
+					std::string exePath = findField("exePath");
+					if (!exePath.empty()) {
+						installed = std::filesystem::exists(gameDir / exePath);
+					}
+				}
+			}
+
+			retval = CefV8Value::CreateBool(installed);
 			std::cout << "Checking if exe is updated for game: " << GameName << " - " << (installed ? "Updated" : "Not Updated") << std::endl;
 			return true;
 		}
@@ -754,16 +903,10 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				}
 			}
 
-			// Construct the download URL from the GitHub releases URL. We always save
-			// to the canonical `<GameName>-windows-x64.exe` so `Play` keeps working
-			// regardless of which build flavour was selected.
-			std::string canonicalExeName = GameName + "-windows-x64.exe";
 			std::string downloadUrl = GameGit + assetName;
 			std::filesystem::path gameDir = std::filesystem::path(GetGamesFolder()) / GameName;
-			std::string localPath = (gameDir / canonicalExeName).string();
 
 			std::cout << "Download URL: " << downloadUrl << std::endl;
-			std::cout << "Local path: " << localPath << std::endl;
 
 			// Construct toml file paths
 			std::string tomlFileName = GameName + ".toml";
@@ -774,58 +917,104 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::string sidecarPath = (gameDir / ".installed.json").string();
 			std::string packagesSidecarPath = (gameDir / ".installed_packages.json").string();
 
+			// For legacy single-exe assets, download to the canonical name so Play()
+			// keeps working without needing the sidecar.
+			bool archiveAsset = isArchiveAsset(assetName);
+			std::string localPath = archiveAsset
+				? (gameDir / assetName).string()
+				: (gameDir / (GameName + "-windows-x64.exe")).string();
+
+			std::cout << "Local path: " << localPath << std::endl;
+
 			// Create the directory if it doesn't exist
 			if (!std::filesystem::exists(gameDir)) {
 				std::filesystem::create_directories(gameDir);
 			}
 
+			// Shared JSON-escape lambda used by the sidecar writer inside the thread.
+			auto jsonEscape = [](const std::string& s) {
+				std::string out;
+				out.reserve(s.size());
+				for (char c : s) {
+					switch (c) {
+						case '"': out += "\\\""; break;
+						case '\\': out += "\\\\"; break;
+						case '\n': out += "\\n"; break;
+						case '\r': out += "\\r"; break;
+						case '\t': out += "\\t"; break;
+						default: out += c; break;
+					}
+				}
+				return out;
+			};
+
 			// Download from GitHub releases
 			std::thread([downloadUrl, localPath, tomlDownloadUrl, tomlLocalPath, sidecarPath, packagesSidecarPath,
-			             assetName, versionTag, packages, gameDir, GameGit]() {
+			             assetName, versionTag, packages, gameDir, GameGit, archiveAsset, jsonEscape]() {
 				try {
 					staticprogress = 0;
 					Networking::FileDownloader downloader;
-					auto exeResult = downloader.downloadFile(downloadUrl, localPath, downloadProgressCallback);
+					auto mainResult = downloader.downloadFile(downloadUrl, localPath, downloadProgressCallback);
 
-					// Try to download the toml file if it exists in the release
-					std::cout << "Checking for toml file: " << tomlDownloadUrl << std::endl;
-					Networking::FileDownloader tomlDownloader;
-					auto tomlResult = tomlDownloader.downloadFile(tomlDownloadUrl, tomlLocalPath, nullptr);
-					if (tomlResult == Networking::FileDownloader::Result::SUCCESS) {
-						std::cout << "Successfully downloaded toml file: " << tomlLocalPath << std::endl;
-					} else {
-						std::cout << "No toml file found in release (this is optional)" << std::endl;
+					if (mainResult != Networking::FileDownloader::Result::SUCCESS) {
+						std::cout << "Update: failed to download " << downloadUrl << std::endl;
+						staticprogress = -1;
+						return;
 					}
 
-					// On a successful exe download, persist what we just installed so
-					// the UI can show the version + build label without re-hashing.
-					if (exeResult == Networking::FileDownloader::Result::SUCCESS) {
-						auto jsonEscape = [](const std::string& s) {
-							std::string out;
-							out.reserve(s.size());
-							for (char c : s) {
-								switch (c) {
-									case '"': out += "\\\""; break;
-									case '\\': out += "\\\\"; break;
-									case '\n': out += "\\n"; break;
-									case '\r': out += "\\r"; break;
-									case '\t': out += "\\t"; break;
-									default: out += c; break;
-								}
+					if (archiveAsset) {
+						// ── New multi-file archive format ─────────────────────────────
+						std::cout << "Update: extracting archive " << localPath << std::endl;
+						bool extracted = ExtractArchive(localPath, gameDir.string());
+						std::error_code ec;
+						std::filesystem::remove(localPath, ec); // delete archive after extraction
+
+						std::string exeFileName;
+						if (extracted) {
+							exeFileName = FindMainExecutable(gameDir, gameDir.filename().string());
+							if (exeFileName.empty()) {
+								std::cout << "Update: warning — no executable found after extraction" << std::endl;
+							} else {
+								std::cout << "Update: found main executable: " << exeFileName << std::endl;
 							}
-							return out;
-						};
+						} else {
+							std::cout << "Update: extraction failed" << std::endl;
+						}
+
+						// Write sidecar with exePath so Play() knows what to launch.
+						std::ofstream sidecar(sidecarPath, std::ios::binary | std::ios::trunc);
+						if (sidecar) {
+							sidecar << "{\"version\":\"" << jsonEscape(versionTag)
+								<< "\",\"asset\":\"" << jsonEscape(assetName)
+								<< "\",\"exePath\":\"" << jsonEscape(exeFileName) << "\"}";
+							std::cout << "Update: wrote sidecar: " << sidecarPath << std::endl;
+						} else {
+							std::cout << "Update: warning — failed to write sidecar at " << sidecarPath << std::endl;
+						}
+					} else {
+						// ── Legacy single-executable format ───────────────────────────
+						// Try to download the optional toml config file.
+						std::cout << "Checking for toml file: " << tomlDownloadUrl << std::endl;
+						Networking::FileDownloader tomlDownloader;
+						auto tomlResult = tomlDownloader.downloadFile(tomlDownloadUrl, tomlLocalPath, nullptr);
+						if (tomlResult == Networking::FileDownloader::Result::SUCCESS) {
+							std::cout << "Successfully downloaded toml file: " << tomlLocalPath << std::endl;
+						} else {
+							std::cout << "No toml file found in release (this is optional)" << std::endl;
+						}
+
+						// Persist installed metadata (no exePath — Play uses canonical name).
 						std::ofstream sidecar(sidecarPath, std::ios::binary | std::ios::trunc);
 						if (sidecar) {
 							sidecar << "{\"version\":\"" << jsonEscape(versionTag)
 								<< "\",\"asset\":\"" << jsonEscape(assetName) << "\"}";
-							std::cout << "Wrote installed sidecar: " << sidecarPath << std::endl;
+							std::cout << "Update: wrote sidecar: " << sidecarPath << std::endl;
 						} else {
-							std::cout << "Warning: failed to write sidecar at " << sidecarPath << std::endl;
+							std::cout << "Update: warning — failed to write sidecar at " << sidecarPath << std::endl;
 						}
 					}
 
-					// Download and extract each zip package
+					// Download and extract each zip package (both formats support this).
 					for (const auto& pkg : packages) {
 						std::cout << "Downloading package: " << pkg.assetName << std::endl;
 						staticprogress = 0;
@@ -838,7 +1027,6 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 						if (pkgResult == Networking::FileDownloader::Result::SUCCESS) {
 							std::cout << "Extracting package: " << pkg.assetName << " -> " << gameDir.string() << std::endl;
 							bool extracted = ExtractZipWithPowerShell(pkgLocalZip, gameDir.string());
-							// Remove the zip regardless of extraction outcome
 							std::error_code ec;
 							std::filesystem::remove(pkgLocalZip, ec);
 
@@ -892,99 +1080,147 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				<< ", GitHubApiUrl: " << GitHubApiUrl
 				<< ", AssetName: " << assetName << std::endl;
 
-			// The exe is always saved canonically as `<GameName>-windows-x64.exe`.
-			std::string canonicalExeName = GameName + "-windows-x64.exe";
-			std::filesystem::path localExePath = std::filesystem::path(GetGamesFolder()) / GameName / canonicalExeName;
+			std::filesystem::path gameDir = std::filesystem::path(GetGamesFolder()) / GameName;
+			std::filesystem::path sidecarPath = gameDir / ".installed.json";
 
-			// If local exe doesn't exist, needs update
-			if (!std::filesystem::exists(localExePath)) {
-				std::cout << "NeedsUpdate: Local exe not found, needs update" << std::endl;
-				retval = CefV8Value::CreateBool(true);
-				return true;
-			}
+			if (isArchiveAsset(assetName)) {
+				// ── Archive format: compare stored version tag against remote tag_name ──
+				// We can't SHA-compare extracted files against the archive, so we rely
+				// on the version tag written into .installed.json at install time.
 
-			// Calculate local file SHA256
-			std::string localSha = Networking::FileDownloader::calculateFileSHA256(localExePath.string());
-			if (localSha.empty()) {
-				std::cout << "NeedsUpdate: Failed to calculate local SHA, assuming needs update" << std::endl;
-				retval = CefV8Value::CreateBool(true);
-				return true;
-			}
-			std::cout << "NeedsUpdate: Local SHA256: " << localSha << std::endl;
-
-			// Fetch release info from GitHub API
-			Networking::FileDownloader downloader;
-			std::string responseBody;
-			auto result = downloader.fetchToString(GitHubApiUrl, responseBody);
-
-			if (result != Networking::FileDownloader::Result::SUCCESS) {
-				std::cout << "NeedsUpdate: Failed to fetch GitHub API: " << downloader.getLastError() << std::endl;
-				retval = CefV8Value::CreateBool(true); // Assume needs update if we can't check
-				return true;
-			}
-
-			// Parse the response to find the sha for the exe asset
-				// GitHub API returns JSON with assets array, each asset has a "name" and "digest" field
-				// The digest field contains the SHA256 hash in format "sha256:HASH"
-
-				// Find the asset with matching exe name and extract its digest
-				std::string remoteSha;
-				size_t assetsPos = responseBody.find("\"assets\"");
-				if (assetsPos != std::string::npos) {
-					// Look for the exe file name in assets
-					std::string nameSearch = "\"name\":\"" + assetName + "\"";
-					size_t exeAssetPos = responseBody.find(nameSearch);
-					if (exeAssetPos == std::string::npos) {
-						// Try with space after colon
-						nameSearch = "\"name\": \"" + assetName + "\"";
-						exeAssetPos = responseBody.find(nameSearch);
-					}
-
-					if (exeAssetPos != std::string::npos) {
-						std::cout << "NeedsUpdate: Found exe asset in response" << std::endl;
-
-						// Find the digest field for this asset (search forward from the name)
-						std::string digestSearch = "\"digest\":";
-						size_t digestPos = responseBody.find(digestSearch, exeAssetPos);
-						if (digestPos == std::string::npos) {
-							digestSearch = "\"digest\": ";
-							digestPos = responseBody.find(digestSearch, exeAssetPos);
-						}
-
-						if (digestPos != std::string::npos) {
-							// Extract the digest value (format: "sha256:HASH")
-							size_t valueStart = responseBody.find("\"", digestPos + digestSearch.length()) + 1;
-							size_t valueEnd = responseBody.find("\"", valueStart);
-							if (valueStart != std::string::npos && valueEnd != std::string::npos) {
-								std::string digestValue = responseBody.substr(valueStart, valueEnd - valueStart);
-								std::cout << "NeedsUpdate: Found digest: " << digestValue << std::endl;
-
-								// Extract hash from "sha256:HASH" format
-								size_t colonPos = digestValue.find(':');
-								if (colonPos != std::string::npos) {
-									remoteSha = digestValue.substr(colonPos + 1);
-								} else {
-									remoteSha = digestValue; // Assume it's just the hash
-								}
-							}
-						}
-					}
-				}
-
-				if (!remoteSha.empty()) {
-					// Convert to lowercase for comparison
-					std::transform(localSha.begin(), localSha.end(), localSha.begin(), ::tolower);
-					std::transform(remoteSha.begin(), remoteSha.end(), remoteSha.begin(), ::tolower);
-
-					bool needsUpdate = (localSha != remoteSha);
-					std::cout << "NeedsUpdate: Remote SHA256: " << remoteSha << std::endl;
-					std::cout << "NeedsUpdate: " << (needsUpdate ? "Update needed" : "Up to date") << std::endl;
-					retval = CefV8Value::CreateBool(needsUpdate);
+				if (!std::filesystem::exists(sidecarPath)) {
+					std::cout << "NeedsUpdate: no sidecar found, needs update" << std::endl;
+					retval = CefV8Value::CreateBool(true);
 					return true;
 				}
 
-				// If we couldn't find the digest, assume needs update
-				std::cout << "NeedsUpdate: Could not find digest in response, assuming needs update" << std::endl;
+				// Read installed version from sidecar.
+				std::string sidecarContents;
+				{
+					std::ifstream f(sidecarPath, std::ios::binary);
+					if (!f) {
+						retval = CefV8Value::CreateBool(true);
+						return true;
+					}
+					sidecarContents = std::string(std::istreambuf_iterator<char>(f), {});
+				}
+
+				// Extract "version" field value using simple search.
+				auto extractJsonString = [](const std::string& json, const std::string& key) -> std::string {
+					std::string search = "\"" + key + "\":\"";
+					size_t pos = json.find(search);
+					if (pos == std::string::npos) {
+						search = "\"" + key + "\": \"";
+						pos = json.find(search);
+					}
+					if (pos == std::string::npos) return "";
+					size_t start = pos + search.size();
+					size_t end = json.find("\"", start);
+					if (end == std::string::npos) return "";
+					return json.substr(start, end - start);
+				};
+
+				std::string installedTag = extractJsonString(sidecarContents, "version");
+				std::cout << "NeedsUpdate: installed tag: " << installedTag << std::endl;
+
+				// Fetch release info and extract tag_name.
+				Networking::FileDownloader downloader;
+				std::string responseBody;
+				auto result = downloader.fetchToString(GitHubApiUrl, responseBody);
+				if (result != Networking::FileDownloader::Result::SUCCESS) {
+					std::cout << "NeedsUpdate: failed to fetch GitHub API, assuming needs update" << std::endl;
+					retval = CefV8Value::CreateBool(true);
+					return true;
+				}
+
+				std::string remoteTag = extractJsonString(responseBody, "tag_name");
+				std::cout << "NeedsUpdate: remote tag: " << remoteTag << std::endl;
+
+				if (remoteTag.empty()) {
+					std::cout << "NeedsUpdate: could not parse tag_name, assuming needs update" << std::endl;
+					retval = CefV8Value::CreateBool(true);
+					return true;
+				}
+
+				// Case-insensitive comparison.
+				std::string installedLower = installedTag, remoteLower = remoteTag;
+				std::transform(installedLower.begin(), installedLower.end(), installedLower.begin(), ::tolower);
+				std::transform(remoteLower.begin(), remoteLower.end(), remoteLower.begin(), ::tolower);
+				bool needsUpdate = (installedLower != remoteLower);
+				std::cout << "NeedsUpdate: " << (needsUpdate ? "update needed" : "up to date") << std::endl;
+				retval = CefV8Value::CreateBool(needsUpdate);
+				return true;
+			}
+
+			// ── Legacy exe format: SHA256 comparison ──────────────────────────────────
+			std::string canonicalExeName = GameName + "-windows-x64.exe";
+			std::filesystem::path localExePath = gameDir / canonicalExeName;
+
+			if (!std::filesystem::exists(localExePath)) {
+				std::cout << "NeedsUpdate: local exe not found, needs update" << std::endl;
+				retval = CefV8Value::CreateBool(true);
+				return true;
+			}
+
+			std::string localSha = Networking::FileDownloader::calculateFileSHA256(localExePath.string());
+			if (localSha.empty()) {
+				std::cout << "NeedsUpdate: failed to calculate local SHA, assuming needs update" << std::endl;
+				retval = CefV8Value::CreateBool(true);
+				return true;
+			}
+			std::cout << "NeedsUpdate: local SHA256: " << localSha << std::endl;
+
+			Networking::FileDownloader downloader;
+			std::string responseBody;
+			auto result = downloader.fetchToString(GitHubApiUrl, responseBody);
+			if (result != Networking::FileDownloader::Result::SUCCESS) {
+				std::cout << "NeedsUpdate: failed to fetch GitHub API: " << downloader.getLastError() << std::endl;
+				retval = CefV8Value::CreateBool(true);
+				return true;
+			}
+
+			std::string remoteSha;
+			size_t assetsPos = responseBody.find("\"assets\"");
+			if (assetsPos != std::string::npos) {
+				std::string nameSearch = "\"name\":\"" + assetName + "\"";
+				size_t exeAssetPos = responseBody.find(nameSearch);
+				if (exeAssetPos == std::string::npos) {
+					nameSearch = "\"name\": \"" + assetName + "\"";
+					exeAssetPos = responseBody.find(nameSearch);
+				}
+				if (exeAssetPos != std::string::npos) {
+					std::cout << "NeedsUpdate: found asset in response" << std::endl;
+					std::string digestSearch = "\"digest\":";
+					size_t digestPos = responseBody.find(digestSearch, exeAssetPos);
+					if (digestPos == std::string::npos) {
+						digestSearch = "\"digest\": ";
+						digestPos = responseBody.find(digestSearch, exeAssetPos);
+					}
+					if (digestPos != std::string::npos) {
+						size_t valueStart = responseBody.find("\"", digestPos + digestSearch.length()) + 1;
+						size_t valueEnd = responseBody.find("\"", valueStart);
+						if (valueStart != std::string::npos && valueEnd != std::string::npos) {
+							std::string digestValue = responseBody.substr(valueStart, valueEnd - valueStart);
+							size_t colonPos = digestValue.find(':');
+							remoteSha = (colonPos != std::string::npos)
+								? digestValue.substr(colonPos + 1)
+								: digestValue;
+						}
+					}
+				}
+			}
+
+			if (!remoteSha.empty()) {
+				std::transform(localSha.begin(), localSha.end(), localSha.begin(), ::tolower);
+				std::transform(remoteSha.begin(), remoteSha.end(), remoteSha.begin(), ::tolower);
+				bool needsUpdate = (localSha != remoteSha);
+				std::cout << "NeedsUpdate: remote SHA256: " << remoteSha << std::endl;
+				std::cout << "NeedsUpdate: " << (needsUpdate ? "update needed" : "up to date") << std::endl;
+				retval = CefV8Value::CreateBool(needsUpdate);
+				return true;
+			}
+
+			std::cout << "NeedsUpdate: could not find digest in response, assuming needs update" << std::endl;
 			retval = CefV8Value::CreateBool(true);
 			return true;
 		}
@@ -1009,14 +1245,36 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				customExePath = arguments[2]->GetStringValue().ToString();
 			}
 
+			std::filesystem::path gameDir2 = std::filesystem::path(GetGamesFolder()) / GameName;
 			std::filesystem::path exePath;
 			if (!customExePath.empty()) {
-				// Normalize forward slashes to backslashes for Windows
+				// Explicit path from JS takes priority (e.g. from a package with hasExecutable).
 				std::replace(customExePath.begin(), customExePath.end(), '/', '\\');
-				exePath = std::filesystem::path(GetGamesFolder()) / GameName / customExePath;
+				exePath = gameDir2 / customExePath;
 			} else {
-				std::string exeFileName = GameName + "-windows-x64.exe";
-				exePath = std::filesystem::path(GetGamesFolder()) / GameName / exeFileName;
+				// For archive-format installs the exe name is stored in .installed.json.
+				std::string sidecarExePath;
+				{
+					std::filesystem::path sidecarPath = gameDir2 / ".installed.json";
+					std::ifstream f(sidecarPath, std::ios::binary);
+					if (f) {
+						std::string contents(std::istreambuf_iterator<char>(f), {});
+						std::string search = "\"exePath\":\"";
+						size_t pos = contents.find(search);
+						if (pos == std::string::npos) { search = "\"exePath\": \""; pos = contents.find(search); }
+						if (pos != std::string::npos) {
+							size_t start = pos + search.size();
+							size_t end = contents.find("\"", start);
+							if (end != std::string::npos) sidecarExePath = contents.substr(start, end - start);
+						}
+					}
+				}
+				if (!sidecarExePath.empty()) {
+					std::replace(sidecarExePath.begin(), sidecarExePath.end(), '/', '\\');
+					exePath = gameDir2 / sidecarExePath;
+				} else {
+					exePath = gameDir2 / (GameName + "-windows-x64.exe");
+				}
 			}
 			if (std::filesystem::exists(exePath)) {
 				std::string patches = "";
