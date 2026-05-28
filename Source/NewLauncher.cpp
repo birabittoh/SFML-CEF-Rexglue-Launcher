@@ -1293,6 +1293,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					RegCloseKey(hKey);
 				}
 				std::string launchArgs = "--user_language=" + std::to_string(userLanguage);
+				launchArgs += " --game_data_root=\"" + (std::filesystem::path(launchDir) / "assets").string() + "\"";
 
 				// NEW: append cvar args
 				if (!cvarArgs.empty()) {
