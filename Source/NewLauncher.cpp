@@ -1245,6 +1245,21 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				customExePath = arguments[2]->GetStringValue().ToString();
 			}
 
+			// Optional fourth arg: whether to append --game_data_root=".../assets".
+			// Defaults to false for backward compatibility with existing games.
+			bool setGameDataRootToAssets = false;
+			if (arguments.size() > 3 && arguments[3]) {
+				if (arguments[3]->IsBool()) {
+					setGameDataRootToAssets = arguments[3]->GetBoolValue();
+				} else if (arguments[3]->IsInt()) {
+					setGameDataRootToAssets = arguments[3]->GetIntValue() != 0;
+				} else if (arguments[3]->IsString()) {
+					std::string s = arguments[3]->GetStringValue().ToString();
+					std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+					setGameDataRootToAssets = (s == "1" || s == "true" || s == "yes");
+				}
+			}
+
 			std::filesystem::path gameDir2 = std::filesystem::path(GetGamesFolder()) / GameName;
 			std::filesystem::path exePath;
 			if (!customExePath.empty()) {
@@ -1293,7 +1308,9 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					RegCloseKey(hKey);
 				}
 				std::string launchArgs = "--user_language=" + std::to_string(userLanguage);
-				launchArgs += " --game_data_root=\"" + (std::filesystem::path(launchDir) / "assets").string() + "\"";
+				if (setGameDataRootToAssets) {
+					launchArgs += " --game_data_root=\"" + (std::filesystem::path(launchDir) / "assets").string() + "\"";
+				}
 
 				// NEW: append cvar args
 				if (!cvarArgs.empty()) {
@@ -1359,7 +1376,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		}
 
 		if (name == "getVersion") {
-			retval = CefV8Value::CreateInt(9); // Returns the current version of the Launcher exe
+			retval = CefV8Value::CreateInt(10); // Returns the current version of the Launcher exe
 			return true;
 		}
 
