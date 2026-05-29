@@ -53,8 +53,8 @@
       <SubSystem>Console</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>glfw3_mt.lib;opengl32.lib;libcef.lib;libcef_dll_wrapper.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>Vendors\GLFW\lib-vc2022;Vendors\Chromium\Release;Vendors\Chromium;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>glfw3_mt.lib;opengl32.lib;libcef.lib;libcef_dll_wrapper.lib;zs.lib;iphlpapi.lib;secur32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>Vendors\GLFW\lib-vc2022;Vendors\Chromium\Release;Vendors\Chromium;Vendors\curl\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalOptions>/SUBSYSTEM:WINDOWS %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <ProjectReference>

@@ -16,3 +16,9 @@ dumped_vehicles/
 # OS files
 Thumbs.db
 .DS_Store
+
+# Executable files
+*.exe
+*.dll
+*.so
+*.x86_64

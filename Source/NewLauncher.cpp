@@ -14,6 +14,17 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
+#elif defined(__linux__)
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <cstdlib>
+#include <cstring>
+extern char** environ;
 #endif
 
 #include <iostream>
@@ -27,20 +38,27 @@
 #include "cef_client.h"
 #include "cef_app.h"
 #include <filesystem>
+#ifdef _WIN32
 #define GLFW_EXPOSE_NATIVE_WIN32
+#elif defined(__linux__)
+#define GLFW_EXPOSE_NATIVE_X11
+#define GLFW_EXPOSE_NATIVE_WAYLAND
+#endif
 #include <GLFW/glfw3native.h>
 #include <thread>
+#include <mutex>
 
 #include "Utils/IsoExtraction.h"
 #include "Networking/FileDownloader.h"
+#ifdef _WIN32
 #include "../resource.h"
+#endif
 
 #include "../VehicleParser.h"
 
 #ifdef _WIN32
 #include <iostream>
 #include <cstdio>
-
 
 bool gameIsRunning = false;
 HANDLE gameProcessHandle = nullptr;
@@ -49,6 +67,86 @@ bool g_consoleInitialized = false;
 
 // Forward declaration for dialog parenting
 extern HWND g_mainWindowHandle;
+#else
+bool gameIsRunning = false;
+pid_t gameProcessHandle = -1;
+#endif
+
+// Non-throwing filesystem helpers (CEF renderer runs sandboxed; seccomp may
+// block statx/mkdir with EPERM which would otherwise terminate the process).
+static bool fs_exists(const std::filesystem::path& p) noexcept {
+    std::error_code ec;
+    return std::filesystem::exists(p, ec);
+}
+static bool fs_is_dir(const std::filesystem::path& p) noexcept {
+    std::error_code ec;
+    return std::filesystem::is_directory(p, ec);
+}
+static void fs_mkdirs(const std::filesystem::path& p) noexcept {
+    std::error_code ec;
+    std::filesystem::create_directories(p, ec);
+}
+
+// ── Platform-agnostic config helpers (Linux only) ────────────────────────────
+#ifndef _WIN32
+static std::filesystem::path ConfigPath_() {
+    const char* home = getenv("HOME");
+    std::filesystem::path dir = home ? std::filesystem::path(home) / ".config" / "GoopieLauncher"
+                                     : std::filesystem::current_path();
+    fs_mkdirs(dir);
+    return dir / "config.ini";
+}
+static std::string ConfigRead_(const std::string& key, const std::string& def) {
+    std::ifstream f(ConfigPath_());
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        if (line.substr(0, eq) == key) return line.substr(eq + 1);
+    }
+    return def;
+}
+static void ConfigWrite_(const std::string& key, const std::string& value) {
+    auto path = ConfigPath_();
+    std::vector<std::string> lines;
+    {
+        std::ifstream f(path);
+        std::string line;
+        bool found = false;
+        while (std::getline(f, line)) {
+            auto eq = line.find('=');
+            if (eq != std::string::npos && line.substr(0, eq) == key) {
+                lines.push_back(key + "=" + value);
+                found = true;
+            } else {
+                lines.push_back(line);
+            }
+        }
+        if (!found) lines.push_back(key + "=" + value);
+    }
+    std::ofstream f(path);
+    for (const auto& l : lines) f << l << "\n";
+}
+static std::string GetDocumentsPath_() {
+    FILE* fp = popen("xdg-user-dir DOCUMENTS 2>/dev/null", "r");
+    if (fp) {
+        char buf[4096] = {};
+        if (fgets(buf, sizeof(buf), fp)) {
+            std::string path(buf);
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
+                path.pop_back();
+            pclose(fp);
+            if (!path.empty()) return path;
+        } else {
+            pclose(fp);
+        }
+    }
+    const char* home = getenv("HOME");
+    return home ? std::string(home) + "/Documents" : ".";
+}
+#endif
+
+#ifdef _WIN32
 
 std::string OpenGamesFolderDialog() {
 	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -139,14 +237,57 @@ void InitConsole()
 	std::cerr.clear();
 	std::cin.clear();
 }
+#else
+// Linux stubs / alternatives
+
+std::string OpenGamesFolderDialog() {
+    FILE* fp = popen("zenity --file-selection --directory --title='Select Games Folder' 2>/dev/null", "r");
+    if (!fp) {
+        std::cerr << "Enter games folder path: ";
+        std::string path;
+        std::getline(std::cin, path);
+        return path;
+    }
+    char buf[4096] = {};
+    std::string result;
+    if (fgets(buf, sizeof(buf), fp)) {
+        result = std::string(buf);
+        while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+            result.pop_back();
+    }
+    pclose(fp);
+    return result;
+}
+
+std::string GetGamesFolder_() {
+    std::string custom = ConfigRead_("GamesPath", "");
+    if (!custom.empty()) return custom;
+    const char* home = getenv("HOME");
+    return home ? std::string(home) + "/.local/share/Goopie/Games"
+                : std::filesystem::current_path().string() + "/Games";
+}
+
+static void InitConsole() { /* no-op: already have a terminal on Linux */ }
+
 #endif
 
 std::atomic<bool> is_cef_initialized(false);
 std::atomic<bool> is_browser_closed(false);
 CefRefPtr<CefBrowser> g_browser;
+#ifdef _WIN32
 WNDPROC original_wnd_proc = nullptr;
 HWND cef_window_handle = nullptr;
 HWND g_mainWindowHandle = nullptr;
+#else
+unsigned long cef_window_handle = 0;
+void* g_mainWindowHandle = nullptr;
+// ── Off-Screen Rendering (Linux) ──────────────────────────────────────────────
+static std::mutex           g_osr_mutex;
+static std::vector<uint8_t> g_osr_pixels;
+static int                  g_osr_w = 1, g_osr_h = 1;
+static bool                 g_osr_dirty = false;
+static double               g_cursor_x = 0, g_cursor_y = 0;
+#endif
 //make a sharable pointer to IsoExtractionProgress
 std::shared_ptr<IsoExtractionProgress> isoExtractionProgress = std::make_shared<IsoExtractionProgress>();
 //FileDownloader
@@ -165,10 +306,9 @@ void downloadProgressCallback(long long downloaded, long long total) {
 }
 
 // ── Zip extraction helper ──────────────────────────────────────────────────
-// Extracts a zip file to destPath using PowerShell's Expand-Archive cmdlet.
-// Runs synchronously (blocks the calling thread until extraction completes).
-// Returns true on success.
-static bool ExtractZipWithPowerShell(const std::string& zipPath, const std::string& destPath) {
+// Extracts a zip file to destPath. Runs synchronously. Returns true on success.
+static bool ExtractZip(const std::string& zipPath, const std::string& destPath) {
+#ifdef _WIN32
 	// Escape single quotes for PowerShell single-quoted strings ('' is the escape)
 	auto escPS = [](const std::string& s) -> std::string {
 		std::string out;
@@ -228,6 +368,13 @@ static bool ExtractZipWithPowerShell(const std::string& zipPath, const std::stri
 		return false;
 	}
 	return true;
+#else
+	std::string cmd = "unzip -o \"" + zipPath + "\" -d \"" + destPath + "\" > /dev/null 2>&1";
+	int ret = system(cmd.c_str());
+	if (ret != 0)
+		std::cout << "ExtractZip: unzip exited with code " << ret << std::endl;
+	return ret == 0;
+#endif
 }
 
 // ── Archive asset helpers ──────────────────────────────────────────────────
@@ -253,12 +400,7 @@ static bool isArchiveAsset(const std::string& name) {
 // Returns true on success. Linux extraction is not yet implemented.
 static bool ExtractArchive(const std::string& archivePath, const std::string& destPath) {
 	if (isZipAsset(archivePath)) {
-#ifdef _WIN32
-		return ExtractZipWithPowerShell(archivePath, destPath);
-#else
-		std::cout << "ExtractArchive: zip extraction not yet implemented on this platform" << std::endl;
-		return false;
-#endif
+		return ExtractZip(archivePath, destPath);
 	}
 	if (isTarGzAsset(archivePath)) {
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
@@ -367,24 +509,24 @@ static void UpdatePackageSidecar(const std::string& sidecarPath, const std::stri
 	if (wf) wf << newJson;
 }
 
-// Window procedure to handle resize messages
+// Window procedure to handle resize messages (Windows only)
+#ifdef _WIN32
 LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 	if (uMsg == WM_SIZE && g_browser && g_browser->GetHost()) {
 		RECT rect;
 		GetClientRect(hwnd, &rect);
 		InitConsole();
 		std::cout << "Window resized: " << rect.right - rect.left << "x" << rect.bottom - rect.top << std::endl;
-		// Get the CEF window handle and resize it
 		if (cef_window_handle) {
-			SetWindowPos(cef_window_handle, NULL, 0, 0, 
-				rect.right - rect.left, rect.bottom - rect.top, 
+			SetWindowPos(cef_window_handle, NULL, 0, 0,
+				rect.right - rect.left, rect.bottom - rect.top,
 				SWP_NOZORDER | SWP_NOACTIVATE);
 		}
-
 		g_browser->GetHost()->WasResized();
 	}
 	return CallWindowProc(original_wnd_proc, hwnd, uMsg, wParam, lParam);
 }
+#endif
 
 class RexBrowserProcessHandler : public CefBrowserProcessHandler {
 	IMPLEMENT_REFCOUNTING(RexBrowserProcessHandler);
@@ -404,8 +546,10 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		CefRefPtr<CefCommandLine> command_line) override {
 		command_line->AppendSwitch("enable-webgl");
 		command_line->AppendSwitch("disable-gpu-sandbox");
-		command_line->AppendSwitch("in-process-gpu");
 
+#ifdef _WIN32
+		// Avoids a separate GPU process on Windows where it causes issues.
+		command_line->AppendSwitch("in-process-gpu");
 		if (IsD3D11Supported()) {
 			command_line->AppendSwitch("enable-gpu");
 			command_line->AppendSwitchWithValue("use-angle", "d3d11");
@@ -413,9 +557,24 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		} else {
 			command_line->AppendSwitchWithValue("use-gl", "swiftshader");
 		}
+#else
+		command_line->AppendSwitch("no-sandbox");
+		// Mirror the GLFW platform hint in Window.cpp: if DISPLAY is set we use
+		// X11 (natively or via XWayland), so CEF must also use x11. Only fall
+		// through to Wayland when DISPLAY is absent (pure Wayland, no XWayland).
+		if (getenv("DISPLAY")) {
+			command_line->AppendSwitchWithValue("ozone-platform", "x11");
+		}
+		// OSR uses a PBuffer surface (not a window surface). SwiftShader is a
+		// reliable software backend for the GPU process on Linux.
+		command_line->AppendSwitchWithValue("use-angle", "swiftshader");
+		command_line->AppendSwitch("disable-gpu-compositing");
+		command_line->AppendSwitch("enable-unsafe-swiftshader");
+#endif
 	}
 
 	static bool IsD3D11Supported() {
+#ifdef _WIN32
 		HMODULE d3d11 = LoadLibraryA("d3d11.dll");
 		if (!d3d11) return false;
 
@@ -434,6 +593,9 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		if (device) device->Release();
 		FreeLibrary(d3d11);
 		return SUCCEEDED(hr);
+#else
+		return false;
+#endif
 	}
 
 	CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override {
@@ -634,22 +796,26 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				return true;
 			}
 			int language = arguments[0]->GetIntValue();
-			// Save to registry
+#ifdef _WIN32
 			HKEY hKey;
 			if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\GoopieLauncher", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
 				RegSetValueExA(hKey, "UserLanguage", 0, REG_DWORD, (const BYTE*)&language, sizeof(DWORD));
 				RegCloseKey(hKey);
-				std::cout << "Language set to: " << language << std::endl;
 				retval = CefV8Value::CreateBool(true);
 			} else {
-				std::cout << "Failed to save language to registry" << std::endl;
 				retval = CefV8Value::CreateBool(false);
 			}
+#else
+			ConfigWrite_("UserLanguage", std::to_string(language));
+			retval = CefV8Value::CreateBool(true);
+#endif
+			std::cout << "Language set to: " << language << std::endl;
 			return true;
 		}
 
 		if (name == "GetLanguage") {
 			int language = 1; // Default to English
+#ifdef _WIN32
 			HKEY hKey;
 			if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\GoopieLauncher", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
 				DWORD value = 0;
@@ -660,29 +826,34 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				}
 				RegCloseKey(hKey);
 			}
+#else
+			try { language = std::stoi(ConfigRead_("UserLanguage", "1")); } catch (...) {}
+#endif
 			retval = CefV8Value::CreateInt(language);
 			std::cout << "GetLanguage: " << language << std::endl;
 			return true;
 		}
 
 		if(name == "SetGamesPath") {
-			//open a file dialog to set the folder where the games are stored, and save it to registry
 			std::string folder = OpenGamesFolderDialog();
-				if (!folder.empty()) {
-					// Save to registry
-					HKEY hKey;
-					if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\GoopieLauncher", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-						RegSetValueExA(hKey, "GamesPath", 0, REG_SZ, (const BYTE*)folder.c_str(), static_cast<DWORD>(folder.size() + 1));
-						RegCloseKey(hKey);
-						std::cout << "Games path set to: " << folder << std::endl;
-					} else {
-						std::cout << "Failed to open registry key for writing" << std::endl;
-						MessageBoxA(nullptr, "Failed to save games path to registry. Please try again.", "Goopie Launcher", MB_ICONERROR | MB_OK);
-					}
+			if (!folder.empty()) {
+#ifdef _WIN32
+				HKEY hKey;
+				if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\GoopieLauncher", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+					RegSetValueExA(hKey, "GamesPath", 0, REG_SZ, (const BYTE*)folder.c_str(), static_cast<DWORD>(folder.size() + 1));
+					RegCloseKey(hKey);
+					std::cout << "Games path set to: " << folder << std::endl;
 				} else {
-					std::cout << "No folder selected" << std::endl;
+					std::cout << "Failed to open registry key for writing" << std::endl;
+					MessageBoxA(nullptr, "Failed to save games path to registry. Please try again.", "Goopie Launcher", MB_ICONERROR | MB_OK);
 				}
-
+#else
+				ConfigWrite_("GamesPath", folder);
+				std::cout << "Games path set to: " << folder << std::endl;
+#endif
+			} else {
+				std::cout << "No folder selected" << std::endl;
+			}
 			return true;
 		}
 
@@ -692,17 +863,24 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		}
 
 		if (name == "testFunction") {
+			std::cout << "testFunction called with argument: " << arguments[0]->GetStringValue().ToString() << std::endl;
+#ifdef _WIN32
 			auto re = MessageBoxA(nullptr, arguments[0]->GetStringValue().ToString().c_str(),
 				"Rexglue Launcher", MB_SYSTEMMODAL | MB_ICONQUESTION | MB_YESNOCANCEL);
 			retval = CefV8Value::CreateString(re == IDYES ? "yes" : re == IDNO ? "no" : "cancel");
-			std::cout << "testFunction called with argument: " << arguments[0]->GetStringValue().ToString() << std::endl;
-
+#else
+			retval = CefV8Value::CreateString("yes");
+#endif
 			return true;
 		}
 
 		if (name == "OpenExternalLink") {
 			std::string url = arguments[0]->GetStringValue().ToString();
+#ifdef _WIN32
 			ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+			system(("xdg-open \"" + url + "\" &").c_str());
+#endif
 			std::cout << "Opening external link: " << url << std::endl;
 			return true;
 		}
@@ -710,7 +888,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		if (name == "isIsoInstalled") {
 			std::string GameName = arguments[0]->GetStringValue().ToString();
 			std::filesystem::path xexPath = std::filesystem::path(GetGamesFolder()) / GameName / "assets" / "default.xex";
-			bool installed = std::filesystem::exists(xexPath);
+			bool installed = fs_exists(xexPath);
 			retval = CefV8Value::CreateBool(installed);
 			std::cout << "Checking if ISO is installed for game: " << GameName << " - " << (installed ? "Installed" : "Not Installed") << std::endl;
 			return true;
@@ -721,7 +899,11 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path gameDir = std::filesystem::path(GetGamesFolder()) / GameName;
 
 			// Check legacy canonical exe first.
+#ifdef _WIN32
 			std::filesystem::path canonicalExe = gameDir / (GameName + "-windows-x64.exe");
+#else
+			std::filesystem::path canonicalExe = gameDir / (GameName + "-linux-x64");
+#endif
 			bool installed = std::filesystem::exists(canonicalExe);
 
 			// For archive-format installs the canonical name doesn't exist — check the
@@ -762,7 +944,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			}
 			std::string GameName = arguments[0]->GetStringValue().ToString();
 			std::filesystem::path sidecarPath = std::filesystem::path(GetGamesFolder()) / GameName / ".installed.json";
-			if (!std::filesystem::exists(sidecarPath)) {
+			if (!fs_exists(sidecarPath)) {
 				retval = CefV8Value::CreateString("");
 				return true;
 			}
@@ -818,7 +1000,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 		if (name == "Uninstall") {
 			std::string GameName = arguments[0]->GetStringValue().ToString();
 			std::filesystem::path GamePath = std::filesystem::path(GetGamesFolder()) / GameName;
-			if (std::filesystem::exists(GamePath)) {
+			if (fs_exists(GamePath)) {
 				// Remove all contents except the saves folder
 				for (const auto& entry : std::filesystem::directory_iterator(GamePath)) {
 					if (entry.path().filename() != "saves") {
@@ -861,14 +1043,17 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 			std::cout << "GameGit URL: " << GameGit << std::endl;
 
-			// Optional asset name (e.g. retip-windows-x64-release.exe). Defaults to
-			// the legacy `<GameName>-windows-x64.exe` for backwards compatibility.
+			// Optional asset name. Defaults to the platform-canonical binary name.
 			std::string assetName;
 			if (arguments.size() >= 3 && arguments[2]->IsString()) {
 				assetName = arguments[2]->GetStringValue().ToString();
 			}
 			if (assetName.empty()) {
+#ifdef _WIN32
 				assetName = GameName + "-windows-x64.exe";
+#else
+				assetName = GameName + "-linux-x64";
+#endif
 			}
 
 			// Optional version tag, recorded in the sidecar so the UI can show
@@ -922,13 +1107,17 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			bool archiveAsset = isArchiveAsset(assetName);
 			std::string localPath = archiveAsset
 				? (gameDir / assetName).string()
+#ifdef _WIN32
 				: (gameDir / (GameName + "-windows-x64.exe")).string();
+#else
+				: (gameDir / (GameName + "-linux-x64")).string();
+#endif
 
 			std::cout << "Local path: " << localPath << std::endl;
 
 			// Create the directory if it doesn't exist
-			if (!std::filesystem::exists(gameDir)) {
-				std::filesystem::create_directories(gameDir);
+			if (!fs_exists(gameDir)) {
+				fs_mkdirs(gameDir);
 			}
 
 			// Shared JSON-escape lambda used by the sidecar writer inside the thread.
@@ -1012,6 +1201,99 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 						} else {
 							std::cout << "Update: warning — failed to write sidecar at " << sidecarPath << std::endl;
 						}
+
+#ifndef _WIN32
+						// If the downloaded file is a gzip archive (tar.gz), extract it.
+						// The asset name may include ".tar.gz" but localPath uses the canonical
+						// exe name (no extension), so the archive lands at localPath unextracted.
+						{
+							unsigned char magic[2] = {0, 0};
+							{
+								std::ifstream mf(localPath, std::ios::binary);
+								if (mf) mf.read(reinterpret_cast<char*>(magic), 2);
+							}
+							if (magic[0] == 0x1f && magic[1] == 0x8b) {
+								std::cout << "Detected tar.gz — extracting..." << std::endl;
+								std::string archivePath = localPath + ".tar.gz";
+								std::error_code ec;
+								std::filesystem::rename(localPath, archivePath, ec);
+								if (!ec) {
+									std::string gameDirStr = gameDir.string();
+									// argv must be non-const pointers; build stable storage
+									std::string arg_xzf = "xzf";
+									std::string arg_C   = "-C";
+									char* tar_argv[] = {
+										(char*)"tar",
+										arg_xzf.data(),
+										archivePath.data(),
+										arg_C.data(),
+										gameDirStr.data(),
+										nullptr
+									};
+									pid_t tar_pid = -1;
+									posix_spawn_file_actions_t fa;
+									posix_spawn_file_actions_init(&fa);
+									int spawnErr = posix_spawnp(&tar_pid, "tar", &fa, nullptr, tar_argv, environ);
+									posix_spawn_file_actions_destroy(&fa);
+									if (spawnErr == 0) {
+										int wstatus = 0;
+										waitpid(tar_pid, &wstatus, 0);
+										if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) {
+											std::cout << "tar.gz extracted successfully" << std::endl;
+										} else {
+											std::cout << "tar exited with error" << std::endl;
+										}
+									} else {
+										std::cout << "posix_spawnp(tar) failed: " << strerror(spawnErr) << std::endl;
+									}
+									std::filesystem::remove(archivePath, ec);
+
+									// Locate the extracted executable. Archives commonly either:
+									//   (a) extract the exe directly to gameDir with the bare game name, or
+									//   (b) extract into a top-level subdirectory.
+									// In both cases, rename it to localPath so Play() finds it.
+									if (!std::filesystem::exists(localPath)) {
+										std::string canonicalName = std::filesystem::path(localPath).filename().string();
+										std::string gameName      = gameDir.filename().string();
+										bool found = false;
+
+										// (a) bare game name at root (e.g. "kameorepowered")
+										{
+											auto p = gameDir / gameName;
+											if (std::filesystem::exists(p)) {
+												std::filesystem::rename(p, localPath, ec);
+												if (!ec) std::cout << "Moved exe to: " << localPath << std::endl;
+												found = true;
+											}
+										}
+
+										// (b) one level deep in a subdirectory
+										if (!found) {
+											for (const auto& entry : std::filesystem::directory_iterator(gameDir, ec)) {
+												if (!entry.is_directory()) continue;
+												for (const std::string& candidate : {canonicalName, gameName}) {
+													auto p = entry.path() / candidate;
+													if (std::filesystem::exists(p)) {
+														std::filesystem::rename(p, localPath, ec);
+														if (!ec) std::cout << "Moved exe to: " << localPath << std::endl;
+														found = true;
+														goto exe_search_done;
+													}
+												}
+											}
+										}
+
+										if (!found) {
+											std::cout << "Warning: could not find executable after tar extraction" << std::endl;
+										}
+										exe_search_done:;
+									}
+								} else {
+									std::cout << "Failed to rename archive for extraction: " << ec.message() << std::endl;
+								}
+							}
+						}
+#endif
 					}
 
 					// Download and extract each zip package (both formats support this).
@@ -1026,7 +1308,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 						if (pkgResult == Networking::FileDownloader::Result::SUCCESS) {
 							std::cout << "Extracting package: " << pkg.assetName << " -> " << gameDir.string() << std::endl;
-							bool extracted = ExtractZipWithPowerShell(pkgLocalZip, gameDir.string());
+						bool extracted = ExtractZip(pkgLocalZip, gameDir.string());
 							std::error_code ec;
 							std::filesystem::remove(pkgLocalZip, ec);
 
@@ -1074,7 +1356,11 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 				assetName = arguments[2]->GetStringValue().ToString();
 			}
 			if (assetName.empty()) {
+#ifdef _WIN32
 				assetName = GameName + "-windows-x64.exe";
+#else
+				assetName = GameName + "-linux-x64";
+#endif
 			}
 			std::cout << "NeedsUpdate: GameName: " << GameName
 				<< ", GitHubApiUrl: " << GitHubApiUrl
@@ -1153,7 +1439,11 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			}
 
 			// ── Legacy exe format: SHA256 comparison ──────────────────────────────────
+#ifdef _WIN32
 			std::string canonicalExeName = GameName + "-windows-x64.exe";
+#else
+			std::string canonicalExeName = GameName + "-linux-x64";
+#endif
 			std::filesystem::path localExePath = gameDir / canonicalExeName;
 
 			if (!std::filesystem::exists(localExePath)) {
@@ -1264,7 +1554,9 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path exePath;
 			if (!customExePath.empty()) {
 				// Explicit path from JS takes priority (e.g. from a package with hasExecutable).
+#ifdef _WIN32
 				std::replace(customExePath.begin(), customExePath.end(), '/', '\\');
+#endif
 				exePath = gameDir2 / customExePath;
 			} else {
 				// For archive-format installs the exe name is stored in .installed.json.
@@ -1285,18 +1577,25 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					}
 				}
 				if (!sidecarExePath.empty()) {
+#ifdef _WIN32
 					std::replace(sidecarExePath.begin(), sidecarExePath.end(), '/', '\\');
+#endif
 					exePath = gameDir2 / sidecarExePath;
 				} else {
+#ifdef _WIN32
 					exePath = gameDir2 / (GameName + "-windows-x64.exe");
+#else
+					exePath = gameDir2 / (GameName + "-linux-x64");
+#endif
 				}
 			}
-			if (std::filesystem::exists(exePath)) {
+			if (fs_exists(exePath)) {
 				std::string patches = "";
 				std::string launchDir = (std::filesystem::path(GetGamesFolder()) / GameName).string();
 				std::string exeFileName = exePath.filename().string();
 
 				int userLanguage = 1;
+#ifdef _WIN32
 				HKEY hKey;
 				if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\GoopieLauncher", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
 					DWORD value = 0;
@@ -1307,24 +1606,24 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					}
 					RegCloseKey(hKey);
 				}
+#else
+				try { userLanguage = std::stoi(ConfigRead_("UserLanguage", "1")); } catch (...) {}
+#endif
 				std::string launchArgs = "--user_language=" + std::to_string(userLanguage);
 				if (setGameDataRootToAssets) {
 					launchArgs += " --game_data_root=\"" + (std::filesystem::path(launchDir) / "assets").string() + "\"";
 				}
 
-				// NEW: append cvar args
 				if (!cvarArgs.empty()) {
 					launchArgs += " " + cvarArgs;
 				}
 
 				std::string fullExePath = exePath.string();
 				std::thread([patches, fullExePath, exeFileName, launchDir, launchArgs]() {
+#ifdef _WIN32
 					std::string command = "\"" + fullExePath + "\"" + patches;
-					if (!launchArgs.empty()) {
-						command += " " + launchArgs;
-					}
+					if (!launchArgs.empty()) command += " " + launchArgs;
 
-					// CreateProcess requires a writable command-line buffer.
 					std::vector<char> cmdBuffer(command.begin(), command.end());
 					cmdBuffer.push_back('\0');
 
@@ -1333,22 +1632,14 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					PROCESS_INFORMATION pi = {};
 
 					BOOL ok = CreateProcessA(
-						fullExePath.c_str(), // application name (absolute path)
-						cmdBuffer.data(),    // mutable command line
-						nullptr,             // process security
-						nullptr,             // thread security
-						FALSE,               // inherit handles
-						0,                   // creation flags
-						nullptr,             // environment
-						launchDir.c_str(),   // working directory
-						&si,
-						&pi);
+						fullExePath.c_str(),
+						cmdBuffer.data(),
+						nullptr, nullptr, FALSE, 0, nullptr,
+						launchDir.c_str(), &si, &pi);
 
 					if (!ok) {
 						DWORD err = GetLastError();
-						std::cerr << "Play: CreateProcess failed (" << err
-							<< ") for: " << command
-							<< " in dir: " << launchDir << std::endl;
+						std::cerr << "Play: CreateProcess failed (" << err << ")" << std::endl;
 						std::string msg = "Failed to launch game.\n\nCommand: " + command +
 							"\nWorking dir: " + launchDir +
 							"\nError code: " + std::to_string(err);
@@ -1359,18 +1650,45 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 					gameProcessHandle = pi.hProcess;
 					gameIsRunning = true;
 					CloseHandle(pi.hThread);
-
 					WaitForSingleObject(pi.hProcess, INFINITE);
-
 					CloseHandle(pi.hProcess);
 					gameProcessHandle = nullptr;
 					gameIsRunning = false;
+#else
+					// Ensure the binary is executable (downloads don't preserve +x)
+					chmod(fullExePath.c_str(), 0755);
+
+					// Build argv from space-separated launchArgs (simple split; avoids shell injection)
+					std::string shellCmd = "\"" + fullExePath + "\"";
+					if (!launchArgs.empty()) shellCmd += " " + launchArgs;
+
+					char* argv_sh[] = {
+						(char*)"/bin/sh", (char*)"-c", shellCmd.data(), nullptr
+					};
+					posix_spawn_file_actions_t fa;
+					posix_spawn_file_actions_init(&fa);
+					pid_t pid;
+					int err = posix_spawn(&pid, "/bin/sh", &fa, nullptr, argv_sh, environ);
+					posix_spawn_file_actions_destroy(&fa);
+
+					if (err != 0) {
+						std::cerr << "Play: posix_spawn failed: " << strerror(err) << std::endl;
+						return;
+					}
+					gameProcessHandle = pid;
+					gameIsRunning = true;
+					int status;
+					waitpid(pid, &status, 0);
+					gameProcessHandle = -1;
+					gameIsRunning = false;
+#endif
 				}).detach();
 			}
 			else {
 				std::cerr << "Play: Executable not found: " << exePath.string() << std::endl;
-				std::string msg = "Game executable not found:\n" + exePath.string();
-				MessageBoxA(nullptr, msg.c_str(), "Goopie Launcher", MB_ICONERROR | MB_OK);
+#ifdef _WIN32
+				MessageBoxA(nullptr, ("Game executable not found:\n" + exePath.string()).c_str(), "Goopie Launcher", MB_ICONERROR | MB_OK);
+#endif
 			}
 			return true;
 		}
@@ -1402,8 +1720,8 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::string zipLocalPath = (gameDir / ZipAssetName).string();
 			std::string packagesSidecarPath = (gameDir / ".installed_packages.json").string();
 
-			if (!std::filesystem::exists(gameDir)) {
-				std::filesystem::create_directories(gameDir);
+			if (!fs_exists(gameDir)) {
+				fs_mkdirs(gameDir);
 			}
 
 			std::thread([GameName, DownloadPrefix, ZipAssetName, zipLocalPath, gameDir, packagesSidecarPath]() {
@@ -1417,7 +1735,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 					if (result == Networking::FileDownloader::Result::SUCCESS) {
 						std::cout << "InstallPackage: extracting " << ZipAssetName << std::endl;
-						bool extracted = ExtractZipWithPowerShell(zipLocalPath, gameDir.string());
+						bool extracted = ExtractZip(zipLocalPath, gameDir.string());
 						std::error_code ec;
 						std::filesystem::remove(zipLocalPath, ec);
 
@@ -1455,7 +1773,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path sidecarPath =
 				std::filesystem::path(GetGamesFolder()) / GameName / ".installed_packages.json";
 
-			if (!std::filesystem::exists(sidecarPath)) {
+			if (!fs_exists(sidecarPath)) {
 				retval = CefV8Value::CreateBool(false);
 				return true;
 			}
@@ -1477,7 +1795,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path savesPath = std::filesystem::path(GetGamesFolder()) / recompName / "saves";
 
 			std::vector<CefString> slots;
-			if (std::filesystem::exists(savesPath) && std::filesystem::is_directory(savesPath)) {
+			if (fs_exists(savesPath) && fs_is_dir(savesPath)) {
 				for (const auto& entry : std::filesystem::directory_iterator(savesPath)) {
 					if (entry.is_directory()) {
 						slots.push_back(entry.path().filename().string());
@@ -1499,7 +1817,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path savesPath = std::filesystem::path(GetGamesFolder()) / recompName / "saves";
 
 			int count = 0;
-			if (std::filesystem::exists(savesPath) && std::filesystem::is_directory(savesPath)) {
+			if (fs_exists(savesPath) && fs_is_dir(savesPath)) {
 				for (const auto& entry : std::filesystem::directory_iterator(savesPath)) {
 					if (entry.is_directory()) {
 						count++;
@@ -1517,7 +1835,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path activeSavePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / ".active";
 
 			std::string activeSave = "";
-			if (std::filesystem::exists(activeSavePath)) {
+			if (fs_exists(activeSavePath)) {
 				std::ifstream file(activeSavePath);
 				if (file.is_open()) {
 					std::getline(file, activeSave);
@@ -1534,26 +1852,35 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::string recompName = arguments[0]->GetStringValue().ToString();
 			std::string saveName = arguments[1]->GetStringValue().ToString();
 
-			// Get Documents folder path
+#ifdef _WIN32
 			char documentsPath[MAX_PATH];
 			if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documentsPath))) {
 				std::cout << "backupSave: Failed to get Documents path" << std::endl;
 				retval = CefV8Value::CreateBool(false);
 				return true;
 			}
+			std::string docsDir(documentsPath);
+#else
+			std::string docsDir = GetDocumentsPath_();
+			if (docsDir.empty()) {
+				std::cout << "backupSave: Failed to get Documents path" << std::endl;
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+#endif
 
-			std::filesystem::path sourcePath = std::filesystem::path(documentsPath) / recompName;
+			std::filesystem::path sourcePath = std::filesystem::path(docsDir) / recompName;
 			std::filesystem::path destPath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / saveName;
 
 			try {
-				if (!std::filesystem::exists(sourcePath)) {
+				if (!fs_exists(sourcePath)) {
 					std::cout << "backupSave: Source path does not exist: " << sourcePath << std::endl;
 					retval = CefV8Value::CreateBool(false);
 					return true;
 				}
 
 				// Create destination directory
-				std::filesystem::create_directories(destPath);
+				fs_mkdirs(destPath);
 
 				// Copy contents recursively
 				std::filesystem::copy(sourcePath, destPath, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
@@ -1579,29 +1906,38 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::string recompName = arguments[0]->GetStringValue().ToString();
 			std::string saveName = arguments[1]->GetStringValue().ToString();
 
-			// Get Documents folder path
+#ifdef _WIN32
 			char documentsPath[MAX_PATH];
 			if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documentsPath))) {
 				std::cout << "restoreSave: Failed to get Documents path" << std::endl;
 				retval = CefV8Value::CreateBool(false);
 				return true;
 			}
+			std::string docsDir(documentsPath);
+#else
+			std::string docsDir = GetDocumentsPath_();
+			if (docsDir.empty()) {
+				std::cout << "restoreSave: Failed to get Documents path" << std::endl;
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+#endif
 
 			std::filesystem::path sourcePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / saveName;
-			std::filesystem::path destPath = std::filesystem::path(documentsPath) / recompName;
+			std::filesystem::path destPath = std::filesystem::path(docsDir) / recompName;
 
 			try {
-				if (!std::filesystem::exists(sourcePath)) {
+				if (!fs_exists(sourcePath)) {
 					std::cout << "restoreSave: Source save does not exist: " << sourcePath << std::endl;
 					retval = CefV8Value::CreateBool(false);
 					return true;
 				}
 
 				// Remove existing destination and recreate
-				if (std::filesystem::exists(destPath)) {
+				if (fs_exists(destPath)) {
 					std::filesystem::remove_all(destPath);
 				}
-				std::filesystem::create_directories(destPath);
+				fs_mkdirs(destPath);
 
 				// Copy contents recursively
 				std::filesystem::copy(sourcePath, destPath, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
@@ -1630,7 +1966,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path savePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / saveName;
 
 			try {
-				if (!std::filesystem::exists(savePath)) {
+				if (!fs_exists(savePath)) {
 					std::cout << "deleteSave: Save does not exist: " << savePath << std::endl;
 					retval = CefV8Value::CreateBool(false);
 					return true;
@@ -1640,7 +1976,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 				// Clear active save marker if this was the active save
 				std::filesystem::path activeSavePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / ".active";
-				if (std::filesystem::exists(activeSavePath)) {
+				if (fs_exists(activeSavePath)) {
 					std::ifstream activeFile(activeSavePath);
 					std::string activeSave;
 					if (activeFile.is_open()) {
@@ -1670,13 +2006,13 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 			std::filesystem::path newPath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / newName;
 
 			try {
-				if (!std::filesystem::exists(oldPath)) {
+				if (!fs_exists(oldPath)) {
 					std::cout << "renameSave: Source save does not exist: " << oldPath << std::endl;
 					retval = CefV8Value::CreateBool(false);
 					return true;
 				}
 
-				if (std::filesystem::exists(newPath)) {
+				if (fs_exists(newPath)) {
 					std::cout << "renameSave: Destination already exists: " << newPath << std::endl;
 					retval = CefV8Value::CreateBool(false);
 					return true;
@@ -1686,7 +2022,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 				// Update active save marker if this was the active save
 				std::filesystem::path activeSavePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / ".active";
-				if (std::filesystem::exists(activeSavePath)) {
+				if (fs_exists(activeSavePath)) {
 					std::ifstream activeFile(activeSavePath);
 					std::string activeSave;
 					if (activeFile.is_open()) {
@@ -1713,15 +2049,13 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 		if (name == "OpenGamesFolder") {
 			std::string gamesFolder = GetGamesFolder_();
-
-
-			// Create the folder if it doesn't exist
-			if (!std::filesystem::exists(gamesFolder)) {
-				std::filesystem::create_directories(gamesFolder);
-			}
-
-			// Open in Windows Explorer
+			if (!fs_exists(gamesFolder))
+				fs_mkdirs(gamesFolder);
+#ifdef _WIN32
 			ShellExecuteA(nullptr, "open", gamesFolder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+			system(("xdg-open \"" + gamesFolder + "\" &").c_str());
+#endif
 			std::cout << "Opening games folder: " << gamesFolder << std::endl;
 			retval = CefV8Value::CreateBool(true);
 			return true;
@@ -1736,23 +2070,32 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 			std::string recompName = arguments[0]->GetStringValue().ToString();
 
-			// Get Documents folder path
+#ifdef _WIN32
 			char documentsPath[MAX_PATH];
 			if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documentsPath))) {
 				std::cout << "openSaveFolder: Failed to get Documents path" << std::endl;
 				retval = CefV8Value::CreateBool(false);
 				return true;
 			}
-
-			std::filesystem::path saveFolderPath = std::filesystem::path(documentsPath) / recompName;
-
-			// Create the folder if it doesn't exist
-			if (!std::filesystem::exists(saveFolderPath)) {
-				std::filesystem::create_directories(saveFolderPath);
+			std::string docsDir(documentsPath);
+#else
+			std::string docsDir = GetDocumentsPath_();
+			if (docsDir.empty()) {
+				std::cout << "openSaveFolder: Failed to get Documents path" << std::endl;
+				retval = CefV8Value::CreateBool(false);
+				return true;
 			}
+#endif
 
-			// Open in Windows Explorer
+			std::filesystem::path saveFolderPath = std::filesystem::path(docsDir) / recompName;
+			if (!fs_exists(saveFolderPath))
+				fs_mkdirs(saveFolderPath);
+
+#ifdef _WIN32
 			ShellExecuteA(nullptr, "open", saveFolderPath.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+			system(("xdg-open \"" + saveFolderPath.string() + "\" &").c_str());
+#endif
 			std::cout << "Opening save folder for " << recompName << ": " << saveFolderPath.string() << std::endl;
 			retval = CefV8Value::CreateBool(true);
 			return true;
@@ -1767,18 +2110,27 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 			std::string recompName = arguments[0]->GetStringValue().ToString();
 
-			// Get Documents folder path
+#ifdef _WIN32
 			char documentsPath[MAX_PATH];
 			if (FAILED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documentsPath))) {
 				std::cout << "deleteCurrentSave: Failed to get Documents path" << std::endl;
 				retval = CefV8Value::CreateBool(false);
 				return true;
 			}
+			std::string docsDir(documentsPath);
+#else
+			std::string docsDir = GetDocumentsPath_();
+			if (docsDir.empty()) {
+				std::cout << "deleteCurrentSave: Failed to get Documents path" << std::endl;
+				retval = CefV8Value::CreateBool(false);
+				return true;
+			}
+#endif
 
-			std::filesystem::path saveFolderPath = std::filesystem::path(documentsPath) / recompName;
+			std::filesystem::path saveFolderPath = std::filesystem::path(docsDir) / recompName;
 
 			try {
-				if (!std::filesystem::exists(saveFolderPath)) {
+				if (!fs_exists(saveFolderPath)) {
 					std::cout << "deleteCurrentSave: Save folder does not exist: " << saveFolderPath << std::endl;
 					// Return true since the goal (no save data) is achieved
 					retval = CefV8Value::CreateBool(true);
@@ -1790,7 +2142,7 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 
 				// Clear active save marker
 				std::filesystem::path activeSavePath = std::filesystem::path(GetGamesFolder()) / recompName / "saves" / ".active";
-				if (std::filesystem::exists(activeSavePath)) {
+				if (fs_exists(activeSavePath)) {
 					std::filesystem::remove(activeSavePath);
 				}
 
@@ -1808,8 +2160,31 @@ class RexApp : public CefApp, public CefRenderProcessHandler, public CefV8Handle
 	}
 };
 
+#ifndef _WIN32
+class RexRenderHandler : public CefRenderHandler {
+	IMPLEMENT_REFCOUNTING(RexRenderHandler);
+public:
+	void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override {
+		rect.Set(0, 0, g_osr_w, g_osr_h);
+	}
+	void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type,
+	             const RectList&, const void* buffer, int w, int h) override {
+		if (type != PET_VIEW) return;
+		std::lock_guard<std::mutex> lk(g_osr_mutex);
+		g_osr_pixels.assign(static_cast<const uint8_t*>(buffer),
+		                     static_cast<const uint8_t*>(buffer) + w * h * 4);
+		g_osr_w = w; g_osr_h = h;
+		g_osr_dirty = true;
+	}
+};
+#endif
+
 class RexClient : public CefClient, public CefLifeSpanHandler {
 	IMPLEMENT_REFCOUNTING(RexClient);
+#ifndef _WIN32
+	CefRefPtr<RexRenderHandler> m_renderHandler{new RexRenderHandler()};
+	CefRefPtr<CefRenderHandler> GetRenderHandler() override { return m_renderHandler; }
+#endif
 
 	CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override {
 		return this;
@@ -1862,27 +2237,26 @@ class RexClient : public CefClient, public CefLifeSpanHandler {
 
 	void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
 		g_browser = nullptr;
+#ifdef _WIN32
 		cef_window_handle = nullptr;
+#else
+		cef_window_handle = 0;
+#endif
 		is_browser_closed = true;
 	}
 };
 
 CefRefPtr<RexClient> client;
 
-// Check if localhost:5173 is available
+// Check if localhost:port is available
 bool IsLocalhostAvailable(int port, int timeoutMs = 500) {
+#ifdef _WIN32
 	WSADATA wsaData;
-	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-		return false;
-	}
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
 
 	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sock == INVALID_SOCKET) {
-		WSACleanup();
-		return false;
-	}
+	if (sock == INVALID_SOCKET) { WSACleanup(); return false; }
 
-	// Set socket to non-blocking mode
 	u_long mode = 1;
 	ioctlsocket(sock, FIONBIO, &mode);
 
@@ -1890,82 +2264,118 @@ bool IsLocalhostAvailable(int port, int timeoutMs = 500) {
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
 	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
 	connect(sock, (sockaddr*)&addr, sizeof(addr));
 
-	// Use select to wait for connection with timeout
-	fd_set writeSet;
-	FD_ZERO(&writeSet);
-	FD_SET(sock, &writeSet);
-
-	timeval timeout;
-	timeout.tv_sec = timeoutMs / 1000;
-	timeout.tv_usec = (timeoutMs % 1000) * 1000;
-
+	fd_set writeSet; FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
+	timeval timeout{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
 	bool available = select(0, nullptr, &writeSet, nullptr, &timeout) > 0;
 
 	closesocket(sock);
 	WSACleanup();
 	return available;
+#else
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) return false;
+
+	int flags = fcntl(sock, F_GETFL, 0);
+	fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+	connect(sock, (sockaddr*)&addr, sizeof(addr));
+
+	fd_set writeSet; FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
+	timeval timeout{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+	bool available = false;
+	if (select(sock + 1, nullptr, &writeSet, nullptr, &timeout) > 0) {
+		int err = 0; socklen_t len = sizeof(err);
+		getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+		available = (err == 0);
+	}
+
+	close(sock);
+	return available;
+#endif
 }
 
-void window_resize_callback(GLFWwindow* window, int width, int height) {
+void window_resize_callback(GLFWwindow* win, int width, int height) {
+#ifdef _WIN32
 	if (g_browser && g_browser->GetHost() && cef_window_handle) {
-		// Resize the CEF window to match the new GLFW window size
 		RECT rect{};
-		GetClientRect(glfwGetWin32Window(window), &rect);
-
-		SetWindowPos(cef_window_handle, NULL, 0, 0, 
-			rect.right - rect.left, rect.bottom - rect.top, 
+		GetClientRect(glfwGetWin32Window(win), &rect);
+		SetWindowPos(cef_window_handle, NULL, 0, 0,
+			rect.right - rect.left, rect.bottom - rect.top,
 			SWP_NOZORDER | SWP_NOACTIVATE);
-
-		// Notify CEF that a move or resize operation has started
 		g_browser->GetHost()->NotifyMoveOrResizeStarted();
-
-		// Notify CEF that the window was resized
 		g_browser->GetHost()->WasResized();
 	}
+#else
+	int fw, fh;
+	glfwGetFramebufferSize(win, &fw, &fh);
+	glViewport(0, 0, fw, fh);
+	{
+		std::lock_guard<std::mutex> lk(g_osr_mutex);
+		g_osr_w = fw; g_osr_h = fh;
+	}
+	if (g_browser && g_browser->GetHost())
+		g_browser->GetHost()->WasResized();
+	(void)width; (void)height;
+#endif
 }
 
 
+#ifdef _WIN32
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
-	// Check for --console launch argument
+	(void)hPrevInstance; (void)nCmdShow;
 	std::string cmdLine(lpCmdLine);
 	if (cmdLine.find("--console") != std::string::npos) {
 		g_consoleEnabled = true;
 		InitConsole();
 		IsoExtraction::EnableConsoleLogging();
 	}
-
 	const CefMainArgs main_args(hInstance);
+#else
+int main(int argc, char** argv)
+{
+	for (int i = 1; i < argc; ++i) {
+		if (std::string(argv[i]) == "--console") {
+			IsoExtraction::EnableConsoleLogging();
+		}
+	}
+	const CefMainArgs main_args(argc, argv);
+#endif
+
 	CefRefPtr<RexApp> app(new RexApp);
 	if (const auto code = CefExecuteProcess(main_args, app.get(), nullptr); code >= 0) {
 		return code;
 	}
 	CefSettings settings;
 	settings.multi_threaded_message_loop = true;
-	//CefString(&settings.cache_path).FromString((std::filesystem::current_path() / "cef_cache").string());
+#ifndef _WIN32
+	settings.windowless_rendering_enabled = true;
+#endif
 	CefInitialize(main_args, settings, app.get(), nullptr);
 
-	//sleep until the cef is ready
 	while (!is_cef_initialized.load()) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 
 	VinceWindow window(1280, 720, "Vince Engine");
 
-	//SendMessage to set icon
+#ifdef _WIN32
 	SendMessage(glfwGetWin32Window(window.getWindow()), WM_SETICON, ICON_SMALL, (LPARAM)LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1)));
 	SendMessage(glfwGetWin32Window(window.getWindow()), WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1)));
 
-	// Set up custom window procedure to handle resize messages
 	HWND hwnd = glfwGetWin32Window(window.getWindow());
 	original_wnd_proc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)CustomWndProc);
-
-	// Store the main window handle for dialog parenting
 	g_mainWindowHandle = hwnd;
 	IsoExtraction::SetMainWindowHandle(hwnd);
+#else
+	IsoExtraction::SetMainWindowHandle(nullptr);
+#endif
 
 	const GLFWvidmode* mode = glfwGetVideoMode(glfwGetPrimaryMonitor());
 	glfwWindowHint(GLFW_RED_BITS, mode->redBits);
@@ -1973,21 +2383,26 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
 	glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
 
-	// Set up the resize callback
 	glfwSetWindowSizeCallback(window.getWindow(), window_resize_callback);
-	window_resize_callback(window.getWindow(), mode->width / 1.5, mode->height / 1.5); // Initial resize to set CEF window size
+	window_resize_callback(window.getWindow(), mode->width / 1.5, mode->height / 1.5);
 
-	// Initialize the client
 	client = new RexClient();
 
-	RECT rect{};
-	GetClientRect(glfwGetWin32Window(window.getWindow()), &rect);
-	CefRect cef_rect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+	int fw, fh;
+	glfwGetFramebufferSize(window.getWindow(), &fw, &fh);
+	CefRect cef_rect(0, 0, fw, fh);
 
 	CefWindowInfo window_info;
+#ifdef _WIN32
 	window_info.SetAsChild(glfwGetWin32Window(window.getWindow()), cef_rect);
+#else
+	{
+		std::lock_guard<std::mutex> lk(g_osr_mutex);
+		g_osr_w = fw; g_osr_h = fh;
+	}
+	window_info.SetAsWindowless(0);
+#endif
 
-	// Try localhost first for development, fall back to production URL
 	std::string browserUrl = "https://goopie.xyz";
 	if (IsLocalhostAvailable(5173)) {
 		browserUrl = "http://localhost:5173/";
@@ -1995,11 +2410,167 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	} else {
 		std::cout << "Using production server at goopie.xyz" << std::endl;
 	}
-	CefBrowserHost::CreateBrowser(window_info, client.get(), "https://goopie.xyz", CefBrowserSettings(), nullptr, nullptr);
-	//CefBrowserHost::CreateBrowser(window_info, client.get(), "http://localhost:5173/", CefBrowserSettings(), nullptr, nullptr);
+	CefBrowserHost::CreateBrowser(window_info, client.get(), browserUrl, CefBrowserSettings(), nullptr, nullptr);
+
+#ifndef _WIN32
+	// ── Fullscreen-quad shader for OSR output ─────────────────────────────────
+	const char* osr_vs_src = R"GLSL(
+#version 130
+in vec4 aPos;
+out vec2 vUV;
+void main() {
+    gl_Position = vec4(aPos.xy, 0.0, 1.0);
+    vUV = aPos.zw;
+}
+)GLSL";
+	const char* osr_fs_src = R"GLSL(
+#version 130
+in vec2 vUV;
+uniform sampler2D uTex;
+void main() {
+    gl_FragColor = texture(uTex, vUV);
+}
+)GLSL";
+	auto compile_sh = [](GLenum t, const char* s) {
+		GLuint sh = glCreateShader(t);
+		glShaderSource(sh, 1, &s, nullptr);
+		glCompileShader(sh);
+		return sh;
+	};
+	GLuint osr_vs = compile_sh(GL_VERTEX_SHADER,   osr_vs_src);
+	GLuint osr_fs = compile_sh(GL_FRAGMENT_SHADER, osr_fs_src);
+	GLuint osr_prog = glCreateProgram();
+	glAttachShader(osr_prog, osr_vs);
+	glAttachShader(osr_prog, osr_fs);
+	glBindAttribLocation(osr_prog, 0, "aPos");
+	glLinkProgram(osr_prog);
+	glDeleteShader(osr_vs);
+	glDeleteShader(osr_fs);
+	glUseProgram(osr_prog);
+	glUniform1i(glGetUniformLocation(osr_prog, "uTex"), 0);
+
+	// bottom-left(-1,-1) → UV(0,1) … top-right(1,1) → UV(1,0)  (flip Y for CEF top-down buffer)
+	const float osr_verts[] = {
+		-1.f, -1.f,  0.f, 1.f,
+		 1.f, -1.f,  1.f, 1.f,
+		-1.f,  1.f,  0.f, 0.f,
+		 1.f,  1.f,  1.f, 0.f,
+	};
+	GLuint osr_vao, osr_vbo, osr_tex;
+	glGenVertexArrays(1, &osr_vao);
+	glGenBuffers(1, &osr_vbo);
+	glBindVertexArray(osr_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, osr_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(osr_verts), osr_verts, GL_STATIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+	glBindVertexArray(0);
+
+	glGenTextures(1, &osr_tex);
+	glBindTexture(GL_TEXTURE_2D, osr_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	const uint8_t osr_blank[4] = {0, 0, 0, 255};
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, osr_blank);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	// ── Input forwarding ──────────────────────────────────────────────────────
+	glfwSetCursorPosCallback(window.getWindow(), [](GLFWwindow*, double x, double y) {
+		g_cursor_x = x; g_cursor_y = y;
+		if (!g_browser) return;
+		CefMouseEvent e{}; e.x = (int)x; e.y = (int)y;
+		g_browser->GetHost()->SendMouseMoveEvent(e, false);
+	});
+	glfwSetMouseButtonCallback(window.getWindow(), [](GLFWwindow*, int btn, int action, int mods) {
+		if (!g_browser) return;
+		CefMouseEvent e{}; e.x = (int)g_cursor_x; e.y = (int)g_cursor_y;
+		if (mods & GLFW_MOD_SHIFT)   e.modifiers |= EVENTFLAG_SHIFT_DOWN;
+		if (mods & GLFW_MOD_CONTROL) e.modifiers |= EVENTFLAG_CONTROL_DOWN;
+		if (mods & GLFW_MOD_ALT)     e.modifiers |= EVENTFLAG_ALT_DOWN;
+		auto cbt = btn == GLFW_MOUSE_BUTTON_RIGHT  ? MBT_RIGHT
+		         : btn == GLFW_MOUSE_BUTTON_MIDDLE ? MBT_MIDDLE : MBT_LEFT;
+		g_browser->GetHost()->SendMouseClickEvent(e, cbt, action == GLFW_RELEASE, 1);
+	});
+	glfwSetScrollCallback(window.getWindow(), [](GLFWwindow*, double dx, double dy) {
+		if (!g_browser) return;
+		CefMouseEvent e{}; e.x = (int)g_cursor_x; e.y = (int)g_cursor_y;
+		g_browser->GetHost()->SendMouseWheelEvent(e, (int)(dx * 40), (int)(dy * 40));
+	});
+	glfwSetCharCallback(window.getWindow(), [](GLFWwindow*, unsigned int cp) {
+		if (!g_browser) return;
+		CefKeyEvent e{};
+		e.type = KEYEVENT_CHAR;
+		e.character = e.unmodified_character = (char16_t)cp;
+		e.windows_key_code = (int)cp;
+		g_browser->GetHost()->SendKeyEvent(e);
+	});
+	glfwSetKeyCallback(window.getWindow(), [](GLFWwindow*, int key, int scancode, int action, int mods) {
+		if (!g_browser || action == GLFW_RELEASE) return;
+		int vk = 0;
+		switch (key) {
+		case GLFW_KEY_BACKSPACE:  vk = 0x08; break;
+		case GLFW_KEY_TAB:        vk = 0x09; break;
+		case GLFW_KEY_ENTER:      vk = 0x0D; break;
+		case GLFW_KEY_ESCAPE:     vk = 0x1B; break;
+		case GLFW_KEY_DELETE:     vk = 0x2E; break;
+		case GLFW_KEY_LEFT:       vk = 0x25; break;
+		case GLFW_KEY_RIGHT:      vk = 0x27; break;
+		case GLFW_KEY_UP:         vk = 0x26; break;
+		case GLFW_KEY_DOWN:       vk = 0x28; break;
+		case GLFW_KEY_HOME:       vk = 0x24; break;
+		case GLFW_KEY_END:        vk = 0x23; break;
+		case GLFW_KEY_PAGE_UP:    vk = 0x21; break;
+		case GLFW_KEY_PAGE_DOWN:  vk = 0x22; break;
+		default: return;
+		}
+		CefKeyEvent e{};
+		e.windows_key_code = vk;
+		e.native_key_code = scancode;
+		if (mods & GLFW_MOD_SHIFT)   e.modifiers |= EVENTFLAG_SHIFT_DOWN;
+		if (mods & GLFW_MOD_CONTROL) e.modifiers |= EVENTFLAG_CONTROL_DOWN;
+		if (mods & GLFW_MOD_ALT)     e.modifiers |= EVENTFLAG_ALT_DOWN;
+		e.type = KEYEVENT_RAWKEYDOWN;
+		g_browser->GetHost()->SendKeyEvent(e);
+		if (vk == 0x08 || vk == 0x0D) {
+			e.type = KEYEVENT_CHAR;
+			e.character = e.unmodified_character = (char16_t)vk;
+			g_browser->GetHost()->SendKeyEvent(e);
+		}
+	});
+#endif
 
 	while (!glfwWindowShouldClose(window.getWindow()))
 	{
+#ifndef _WIN32
+		glClearColor(0.f, 0.f, 0.f, 1.f);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		if (g_osr_dirty) {
+			std::vector<uint8_t> px;
+			int tw, th;
+			{
+				std::lock_guard<std::mutex> lk(g_osr_mutex);
+				px = g_osr_pixels;
+				tw = g_osr_w; th = g_osr_h;
+				g_osr_dirty = false;
+			}
+			if (!px.empty()) {
+				glBindTexture(GL_TEXTURE_2D, osr_tex);
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_BGRA,
+				             GL_UNSIGNED_BYTE, px.data());
+			}
+		}
+
+		glUseProgram(osr_prog);
+		glBindVertexArray(osr_vao);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, osr_tex);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+		window.EndFrame();
+#endif
 		glfwPollEvents();
 	}
 
@@ -2008,6 +2579,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	}
 
 	CefShutdown();
-	return 1;
+	return 0;
 }
 

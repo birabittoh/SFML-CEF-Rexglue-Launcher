@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <vector>
 
 #include <curl/curl.h>
 
@@ -12,6 +13,12 @@
 #include <Windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "libcurl.lib")
+#pragma comment(lib, "Wldap32.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Ws2_32.lib")
+#else
+#include "../Utils/Crypto/sha256.h"
 #endif
 
 namespace Networking {
@@ -162,7 +169,7 @@ void FileDownloader::downloadFromGameServerAsync(const std::string& filePath, co
                                                 CompletionCallback completionCallback) {
 	std::cout << "Starting async download from game server: " << filePath << std::endl;
     // Launch the download in a new thread
-    std::thread([=]() {
+    std::thread([=, this]() {
         Result result = downloadFromGameServer(filePath, localPath, progressCallback);
         if (completionCallback) {
             completionCallback(result);
@@ -261,7 +268,28 @@ std::string FileDownloader::calculateFileSHA256(const std::string& filePath) {
     }
     return oss.str();
 #else
-    return "";
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open())
+        return "";
+
+    SHA256_CTX1 ctx;
+    sha256_init(&ctx);
+
+    const size_t bufferSize = 65536;
+    std::vector<char> buffer(bufferSize);
+    while (file.read(buffer.data(), bufferSize) || file.gcount() > 0) {
+        sha256_update(&ctx,
+            reinterpret_cast<const unsigned char*>(buffer.data()),
+            static_cast<size_t>(file.gcount()));
+    }
+
+    unsigned char hash[SHA256_BLOCK_SIZE];
+    sha256_final(&ctx, hash);
+
+    std::ostringstream oss;
+    for (unsigned char b : hash)
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+    return oss.str();
 #endif
 }
 

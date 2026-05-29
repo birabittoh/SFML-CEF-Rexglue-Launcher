@@ -1,0 +1,190 @@
+name: _build (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string (short SHA or tag name)"
+        type: string
+        required: true
+      platform:
+        description: "Target platform: linux or windows"
+        type: string
+        required: true
+      arch:
+        description: "Target architecture: x86_64 or aarch64"
+        type: string
+        required: true
+    outputs:
+      artifact-name:
+        description: "Name of the uploaded artifact"
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+env:
+  CEF_VERSION: "148.0.9+g0d9d52a+chromium-148.0.7778.180"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-22.04' || 'windows-latest' }}
+    outputs:
+      artifact-name: ${{ steps.artifact-name.outputs.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Linux ──────────────────────────────────────────────────────────────
+      - name: Install Linux dependencies
+        if: inputs.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libglfw3-dev libcurl4-openssl-dev \
+            libgl1-mesa-dev libx11-dev \
+            cmake ninja-build \
+            zenity unzip curl
+
+      - name: Cache CEF (Linux)
+        if: inputs.platform == 'linux'
+        id: cache-cef-linux
+        uses: actions/cache@v4
+        with:
+          path: Vendors/Chromium
+          key: cef-${{ inputs.platform }}-${{ inputs.arch }}-${{ env.CEF_VERSION }}
+
+      - name: Download and build CEF (Linux)
+        if: inputs.platform == 'linux' && steps.cache-cef-linux.outputs.cache-hit != 'true'
+        run: make download-cef
+
+      - name: Build (Linux)
+        if: inputs.platform == 'linux'
+        run: make _build
+        env:
+          VERSION: ${{ inputs.version }}
+
+      # ── Windows ────────────────────────────────────────────────────────────
+      - name: Cache CEF (Windows)
+        if: inputs.platform == 'windows'
+        id: cache-cef-win
+        uses: actions/cache@v4
+        with:
+          path: Vendors/Chromium
+          key: cef-${{ inputs.platform }}-${{ inputs.arch }}-${{ env.CEF_VERSION }}
+
+      - name: Download CEF (Windows)
+        if: inputs.platform == 'windows' && steps.cache-cef-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $archive = "cef_binary_$($env:CEF_VERSION)_windows64.tar.bz2"
+          $url = "https://cef-builds.spotifycdn.com/$archive"
+          $urlEncoded = $url.Replace('+', '%2B')
+          Write-Host "Downloading $urlEncoded"
+          curl.exe -L --progress-bar $urlEncoded -o cef.tar.bz2
+          New-Item -ItemType Directory -Force -Path Vendors\Chromium | Out-Null
+          tar xjf cef.tar.bz2 --strip-components=1 -C Vendors\Chromium
+          Remove-Item cef.tar.bz2
+
+      - name: Build libcef_dll_wrapper (Windows)
+        if: inputs.platform == 'windows' && steps.cache-cef-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cmake -B Vendors/Chromium/build -S Vendors/Chromium `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DUSE_SANDBOX=OFF
+          cmake --build Vendors/Chromium/build `
+            --target libcef_dll_wrapper --config Release
+          $lib = Get-ChildItem -Recurse -Filter libcef_dll_wrapper.lib Vendors/Chromium/build | Select-Object -First 1
+          Write-Host "Found lib at: $($lib.FullName)"
+          Copy-Item $lib.FullName Vendors\Chromium\Release\
+
+      - name: Install curl dev (Windows)
+        if: inputs.platform == 'windows'
+        shell: pwsh
+        run: |
+          vcpkg install curl:x64-windows-static
+          $inst = "C:\vcpkg\installed\x64-windows-static"
+          New-Item -ItemType Directory -Force -Path Vendors\curl\lib | Out-Null
+          Copy-Item -Recurse -Force "$inst\include\curl\*" "Vendors\curl"
+          $curlLib = Get-ChildItem -Recurse -Filter "libcurl*.lib" $inst\lib | Select-Object -First 1
+          Write-Host "Copying curl lib: $($curlLib.FullName)"
+          Copy-Item $curlLib.FullName "Vendors\curl\lib\libcurl.lib"
+          Copy-Item "$inst\lib\zs.lib" "Vendors\curl\lib\"
+
+      - name: Find MSBuild
+        if: inputs.platform == 'windows'
+        id: find-msbuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Windows)
+        if: inputs.platform == 'windows'
+        shell: pwsh
+        run: |
+          $targetName = "Goopie-Launcher-${{ inputs.version }}-windows-${{ inputs.arch }}"
+          msbuild URGL-Launcher.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:PlatformToolset=v143 `
+            "/p:TargetName=$targetName" `
+            /m
+
+      - name: Copy CEF runtime files (Windows)
+        if: inputs.platform == 'windows'
+        shell: pwsh
+        run: |
+          $out = "Build\Release-windows-x86_64\URGL-Launcher"
+          $cef = "Vendors\Chromium\Release"
+          $res = "Vendors\Chromium\Resources"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem "$cef\*.dll" | Copy-Item -Destination $out
+          Get-ChildItem "$cef\*.bin" | Copy-Item -Destination $out
+          Get-ChildItem "$cef\*.json" | Copy-Item -Destination $out
+          Get-ChildItem "$res\*.pak" | Copy-Item -Destination $out
+          Get-ChildItem "$res\*.dat" | Copy-Item -Destination $out
+          Copy-Item "$res\locales" $out -Recurse -Force
+
+      # ── Artifact ───────────────────────────────────────────────────────────
+      - name: Set artifact name
+        id: artifact-name
+        shell: bash
+        run: |
+          if [ "${{ inputs.platform }}" = "linux" ]; then
+            echo "name=Goopie-Launcher-${{ inputs.version }}-${{ inputs.platform }}.${{ inputs.arch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=Goopie-Launcher-${{ inputs.version }}-${{ inputs.platform }}-${{ inputs.arch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact (Linux)
+        if: inputs.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: |
+            Build/linux-*/Goopie-Launcher-*-linux.*
+            Build/linux-*/Assets/
+            Build/linux-*/libcef.so
+            Build/linux-*/locales/
+            Build/linux-*/*.pak
+            Build/linux-*/icudtl.dat
+            Build/linux-*/v8_context_snapshot.bin
+            Build/linux-*/libEGL.so
+            Build/linux-*/libGLESv2.so
+            Build/linux-*/libvk_swiftshader.so
+            Build/linux-*/libvulkan.so.1
+            Build/linux-*/vk_swiftshader_icd.json
+
+      - name: Upload artifact (Windows)
+        if: inputs.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: |
+            Build/Release-windows-x86_64/URGL-Launcher/Goopie-Launcher-*.exe
+            Build/Release-windows-x86_64/URGL-Launcher/Assets/
+            Build/Release-windows-x86_64/URGL-Launcher/*.dll
+            Build/Release-windows-x86_64/URGL-Launcher/*.pak
+            Build/Release-windows-x86_64/URGL-Launcher/*.dat
+            Build/Release-windows-x86_64/URGL-Launcher/*.bin
+            Build/Release-windows-x86_64/URGL-Launcher/*.json
+            Build/Release-windows-x86_64/URGL-Launcher/locales/

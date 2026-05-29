@@ -1,18 +1,19 @@
 #include "Window.h"
 #include "OpenGL_Stuff.h"
 
+#ifdef _WIN32
 #define GLFW_EXPOSE_NATIVE_WIN32
-
-#include <GLFW/glfw3native.h> // Include this for native access
-
-
 #pragma comment(lib, "dwmapi.lib")
-
 #include <dwmapi.h>
+#elif defined(__linux__)
+#define GLFW_EXPOSE_NATIVE_X11
+#endif
+#include <GLFW/glfw3native.h>
 
 
 void VinceWindow::EnableBlur()
 {
+#ifdef _WIN32
 	HWND hwnd = glfwGetWin32Window(window.get());
 	if (!hwnd) return;
 
@@ -55,11 +56,20 @@ void VinceWindow::EnableBlur()
 		}
 		FreeLibrary(hModule);
 	}
+#endif
+	// On Linux the compositor handles transparency via GLFW_TRANSPARENT_FRAMEBUFFER.
 }
 
 void VinceWindow::init()
 {
 	glfwSetErrorCallback(glfw_error_callback);
+#ifdef __linux__
+	// CEF's SetAsChild requires an X11 window handle. Prefer X11 (works
+	// natively or via XWayland); fall back to Wayland only when DISPLAY
+	// is absent (pure Wayland without XWayland).
+	if (getenv("DISPLAY"))
+		glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+#endif
 	if (!glfwInit())
 		assert(false && "Failed to initialize GLFW");
 

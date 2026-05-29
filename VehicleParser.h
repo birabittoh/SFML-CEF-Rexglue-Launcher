@@ -6,18 +6,29 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
 #include <shlobj.h>
+#endif
 
 //Parses the save files of nuts and bolts and converts it to a json that the website can read for the model viewer.
 
 namespace detail {
+#ifdef _WIN32
 	inline uint16_t bswap16(uint16_t v) { return _byteswap_ushort(v); }
 	inline uint32_t bswap32(uint32_t v) { return _byteswap_ulong(v); }
+#else
+	inline uint16_t bswap16(uint16_t v) { return static_cast<uint16_t>((v >> 8) | (v << 8)); }
+	inline uint32_t bswap32(uint32_t v) {
+		return ((v & 0xFF000000u) >> 24) | ((v & 0x00FF0000u) >> 8)
+		     | ((v & 0x0000FF00u) << 8)  | ((v & 0x000000FFu) << 24);
+	}
+#endif
 	inline float bswapf(float v) {
 		uint32_t tmp;
 		memcpy(&tmp, &v, 4);
-		tmp = _byteswap_ulong(tmp);
+		tmp = bswap32(tmp);
 		memcpy(&v, &tmp, 4);
 		return v;
 	}
@@ -56,18 +67,38 @@ struct Vehicle {
 };
 
 inline std::string WStringToUtf8(const wchar_t* wstr) {
-    if (!wstr || wstr[0] == L'\0') {
-        return std::string();
-    }
-
+    if (!wstr || wstr[0] == L'\0')
+        return {};
+#ifdef _WIN32
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
-    if (size_needed <= 0) {
-        return std::string();
-    }
-
+    if (size_needed <= 0)
+        return {};
     std::string result(size_needed - 1, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &result[0], size_needed, NULL, NULL);
     return result;
+#else
+    // On Linux wchar_t is 4 bytes (UTF-32); encode each code point to UTF-8.
+    std::string result;
+    for (const wchar_t* p = wstr; *p; ++p) {
+        uint32_t cp = static_cast<uint32_t>(*p);
+        if (cp < 0x80) {
+            result += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            result += static_cast<char>(0xC0 | (cp >> 6));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            result += static_cast<char>(0xE0 | (cp >> 12));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            result += static_cast<char>(0xF0 | (cp >> 18));
+            result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return result;
+#endif
 }
 
 
@@ -99,11 +130,16 @@ class VehicleSaveManager {
 		void ReloadVehicles() {
 			vehicles.clear();
 
+#ifdef _WIN32
 			wchar_t docsPathW[MAX_PATH];
 			if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, docsPathW)))
 				return;
-
 			std::filesystem::path basePath = std::filesystem::path(docsPathW) / "renut" / "B13EBABEBABEBABE" / "4D5307ED";
+#else
+			const char* home = getenv("HOME");
+			if (!home) return;
+			std::filesystem::path basePath = std::filesystem::path(home) / "renut" / "B13EBABEBABEBABE" / "4D5307ED";
+#endif
 			std::filesystem::path headersPath = basePath / "Headers" / "00000001";
 
 			if (!std::filesystem::exists(headersPath))

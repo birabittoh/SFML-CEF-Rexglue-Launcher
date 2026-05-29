@@ -9,6 +9,7 @@
 #pragma once
 
 /*************************** HEADER FILES ***************************/
+#include <cstring>
 //#include <stddef.h>
 
 
@@ -39,7 +40,7 @@ static const unsigned int k[64] = {
 
 
 
-static struct SHA256_CTX1 {
+struct SHA256_CTX1 {
 	unsigned char data[64] = {};
 	unsigned int datalen = 0;
 	unsigned long long bitlen = 0;

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha-short: ${{ steps.sha.outputs.short }}
+    steps:
+      - id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: prepare
+    name: Build linux/x86_64
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.prepare.outputs.sha-short }}
+      platform: linux
+      arch: x86_64
+
+  build-windows:
+    needs: prepare
+    name: Build windows/x86_64
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.prepare.outputs.sha-short }}
+      platform: windows
+      arch: x86_64
