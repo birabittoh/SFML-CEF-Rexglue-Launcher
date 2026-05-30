@@ -39,6 +39,14 @@ jobs:
       - name: List artifacts
         run: find artifacts/ -type f | sort
 
+      - name: Zip each platform artifact
+        run: |
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            (cd "$name" && zip -r "../$name.zip" .)
+          done
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -46,5 +54,5 @@ jobs:
           name: "Goopie Launcher ${{ github.ref_name }}"
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          files: artifacts/**/*
+          files: artifacts/*.zip
           generate_release_notes: true

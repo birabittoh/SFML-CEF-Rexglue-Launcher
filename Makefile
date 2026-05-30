@@ -20,7 +20,7 @@ VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null || git rev-pars
 
 # ── Output ───────────────────────────────────────────────────────────────────
 BUILDDIR := Build/$(PLATFORM)-$(ARCH)
-TARGET   := $(BUILDDIR)/Goopie-Launcher-$(VERSION)-$(PLATFORM).$(ARCH)
+TARGET   := $(BUILDDIR)/Goopie-Launcher.$(ARCH)
 
 # ── Toolchain ─────────────────────────────────────────────────────────────────
 CXX := g++

@@ -121,7 +121,7 @@ jobs:
         if: inputs.platform == 'windows'
         shell: pwsh
         run: |
-          $targetName = "Goopie-Launcher-${{ inputs.version }}-windows-${{ inputs.arch }}"
+          $targetName = "Goopie-Launcher"
           msbuild URGL-Launcher.vcxproj `
             /p:Configuration=Release `
             /p:Platform=x64 `
@@ -161,18 +161,18 @@ jobs:
         with:
           name: ${{ steps.artifact-name.outputs.name }}
           path: |
-            Build/linux-*/Goopie-Launcher-*-linux.*
-            Build/linux-*/Assets/
-            Build/linux-*/libcef.so
-            Build/linux-*/locales/
-            Build/linux-*/*.pak
-            Build/linux-*/icudtl.dat
-            Build/linux-*/v8_context_snapshot.bin
-            Build/linux-*/libEGL.so
-            Build/linux-*/libGLESv2.so
-            Build/linux-*/libvk_swiftshader.so
-            Build/linux-*/libvulkan.so.1
-            Build/linux-*/vk_swiftshader_icd.json
+            Build/linux-${{ inputs.arch }}/Goopie-Launcher.${{ inputs.arch }}
+            Build/linux-${{ inputs.arch }}/Assets/
+            Build/linux-${{ inputs.arch }}/libcef.so
+            Build/linux-${{ inputs.arch }}/locales/
+            Build/linux-${{ inputs.arch }}/*.pak
+            Build/linux-${{ inputs.arch }}/icudtl.dat
+            Build/linux-${{ inputs.arch }}/v8_context_snapshot.bin
+            Build/linux-${{ inputs.arch }}/libEGL.so
+            Build/linux-${{ inputs.arch }}/libGLESv2.so
+            Build/linux-${{ inputs.arch }}/libvk_swiftshader.so
+            Build/linux-${{ inputs.arch }}/libvulkan.so.1
+            Build/linux-${{ inputs.arch }}/vk_swiftshader_icd.json
 
       - name: Upload artifact (Windows)
         if: inputs.platform == 'windows'
@@ -180,7 +180,7 @@ jobs:
         with:
           name: ${{ steps.artifact-name.outputs.name }}
           path: |
-            Build/Release-windows-x86_64/URGL-Launcher/Goopie-Launcher-*.exe
+            Build/Release-windows-x86_64/URGL-Launcher/Goopie-Launcher.exe
             Build/Release-windows-x86_64/URGL-Launcher/Assets/
             Build/Release-windows-x86_64/URGL-Launcher/*.dll
             Build/Release-windows-x86_64/URGL-Launcher/*.pak
