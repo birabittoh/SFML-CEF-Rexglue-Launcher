@@ -149,11 +149,7 @@ jobs:
         id: artifact-name
         shell: bash
         run: |
-          if [ "${{ inputs.platform }}" = "linux" ]; then
-            echo "name=Goopie-Launcher-${{ inputs.version }}-${{ inputs.platform }}.${{ inputs.arch }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=Goopie-Launcher-${{ inputs.version }}-${{ inputs.platform }}-${{ inputs.arch }}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "name=Goopie-Launcher-${{ inputs.version }}-${{ inputs.platform }}-${{ inputs.arch }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact (Linux)
         if: inputs.platform == 'linux'
