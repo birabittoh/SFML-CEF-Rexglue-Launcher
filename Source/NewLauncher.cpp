@@ -2249,42 +2249,30 @@ class RexClient : public CefClient, public CefLifeSpanHandler {
 CefRefPtr<RexClient> client;
 
 // Check if localhost:port is available
-bool IsLocalhostAvailable(int port, int timeoutMs = 500) {
+// Probe a single loopback address (already filled sockaddr + length).
+// Returns true if a TCP connection succeeds within timeoutMs.
+static bool ProbeLoopbackAddress(int af, const sockaddr* addr, socklen_t addrLen, int timeoutMs) {
 #ifdef _WIN32
-	WSADATA wsaData;
-	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
-
-	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sock == INVALID_SOCKET) { WSACleanup(); return false; }
+	SOCKET sock = socket(af, SOCK_STREAM, IPPROTO_TCP);
+	if (sock == INVALID_SOCKET) return false;
 
 	u_long mode = 1;
 	ioctlsocket(sock, FIONBIO, &mode);
-
-	sockaddr_in addr{};
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-	connect(sock, (sockaddr*)&addr, sizeof(addr));
+	connect(sock, addr, addrLen);
 
 	fd_set writeSet; FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
 	timeval timeout{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
 	bool available = select(0, nullptr, &writeSet, nullptr, &timeout) > 0;
 
 	closesocket(sock);
-	WSACleanup();
 	return available;
 #else
-	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	int sock = socket(af, SOCK_STREAM, 0);
 	if (sock < 0) return false;
 
 	int flags = fcntl(sock, F_GETFL, 0);
 	fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-	sockaddr_in addr{};
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(port);
-	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-	connect(sock, (sockaddr*)&addr, sizeof(addr));
+	connect(sock, addr, addrLen);
 
 	fd_set writeSet; FD_ZERO(&writeSet); FD_SET(sock, &writeSet);
 	timeval timeout{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
@@ -2298,6 +2286,41 @@ bool IsLocalhostAvailable(int port, int timeoutMs = 500) {
 	close(sock);
 	return available;
 #endif
+}
+
+// Check whether something is listening on the given loopback port.
+// Tries IPv6 (::1) first, then IPv4 (127.0.0.1), so it works correctly
+// when the server binds to only one family (e.g. Vite defaults to IPv6
+// on systems where localhost resolves to ::1).
+bool IsLocalhostAvailable(int port, int timeoutMs = 500) {
+#ifdef _WIN32
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
+#endif
+
+	// IPv6 probe: ::1
+	sockaddr_in6 addr6{};
+	addr6.sin6_family = AF_INET6;
+	addr6.sin6_port = htons(port);
+	inet_pton(AF_INET6, "::1", &addr6.sin6_addr);
+	if (ProbeLoopbackAddress(AF_INET6, (sockaddr*)&addr6, sizeof(addr6), timeoutMs)) {
+#ifdef _WIN32
+		WSACleanup();
+#endif
+		return true;
+	}
+
+	// IPv4 probe: 127.0.0.1
+	sockaddr_in addr4{};
+	addr4.sin_family = AF_INET;
+	addr4.sin_port = htons(port);
+	inet_pton(AF_INET, "127.0.0.1", &addr4.sin_addr);
+	bool available = ProbeLoopbackAddress(AF_INET, (sockaddr*)&addr4, sizeof(addr4), timeoutMs);
+
+#ifdef _WIN32
+	WSACleanup();
+#endif
+	return available;
 }
 
 void window_resize_callback(GLFWwindow* win, int width, int height) {
